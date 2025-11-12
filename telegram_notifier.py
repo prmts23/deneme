@@ -115,8 +115,8 @@ class TelegramNotifier:
 async def test_telegram():
     """Test telegram gönderimi"""
     notifier = TelegramNotifier(
-        bot_token="8252371895:AAFleOvcPsxmiOh82x2QvAfUuwLcv1eI8Dw",
-        chat_id="652342213",
+        bot_token=":",
+        chat_id="",
         enabled=True
     )
     
