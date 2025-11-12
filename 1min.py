@@ -141,8 +141,8 @@ class CVDIndicator:
 
 
 class PairStrategyWithCVD:
-    """1-minute bars + CVD ile strateji"""
-    
+    """1-minute bars + CVD ile strateji - DÜZELTILMIŞ"""
+
     def __init__(
         self,
         pair: str,
@@ -152,35 +152,66 @@ class PairStrategyWithCVD:
         self.pair = pair
         self.notifier = notifier
         self.stats_report_interval = stats_report_interval
-        
+
         # Bar builder
         self.bar_builder = MinuteBarBuilder()
-        
+
         # Indicators
         self.indicators = Indicators(max_history=300)
         self.cvd = CVDIndicator(max_history=300)
-        
+
         # Strategy state
-        self.position = None
+        self.position = None  # "LONG" or "SHORT" or None
         self.entry_price = None
         self.entry_time = None
         self.entry_bar_index = None
         self.entry_cvd_trend = None
-        
+
+        # ✅ YENİ: Entry anındaki değerleri sakla (değişmesin!)
+        self.entry_atr = None
+        self.stop_loss = None
+        self.take_profit = None
+        self.highest_price_since_entry = None
+        self.lowest_price_since_entry = None
+
         # Stats
         self.stats = TradeStats(max_history=1000)
         self.last_stats_report = datetime.now()
-        
-        # Parameters
+
+        # Technical Parameters
         self.atr_period = 14
         self.rsi_period = 14
         self.win_rate_threshold = 0.49
-        
+
         # CVD Parameters
         self.cvd_momentum_period = 5
-        self.cvd_delta_threshold = 0.5  # Min. delta ratio
-        
-        print(f"✅ {pair} strategy başlatıldı (1-MIN + CVD)")
+        self.cvd_delta_threshold = 0.5
+
+        # ✅ YENİ: SL/TP Multipliers - Basit ve net
+        self.sl_atr_multiplier = 2.0   # Stop Loss: 2×ATR
+        self.tp_atr_multiplier = 3.0   # Take Profit: 3×ATR (Risk/Reward = 1:1.5)
+        self.min_risk_reward = 1.5     # Minimum R/R oranı
+
+        # ✅ YENİ: Trailing Stop
+        self.use_trailing_stop = True
+        self.trailing_stop_trigger = 2.0  # 2×ATR kar sonra trailing aktif
+        self.trailing_stop_distance = 1.0 # 1×ATR mesafede trailing SL
+
+        # ✅ YENİ: Fees & Slippage (BTCTurk)
+        self.maker_fee = 0.0008   # 0.08%
+        self.taker_fee = 0.0016   # 0.16%
+        self.slippage = 0.0005    # 0.05% tahmini slippage
+
+        # Entry Signal Parameters
+        self.rsi_oversold = 35    # RSI < 35 → oversold (LONG)
+        self.rsi_overbought = 65  # RSI > 65 → overbought (SHORT)
+        self.cvd_momentum_threshold = 2.0  # Minimum CVD momentum
+        self.buy_ratio_threshold = 0.60    # Buy ratio > 60% (LONG)
+        self.sell_ratio_threshold = 0.40   # Buy ratio < 40% (SHORT)
+
+        print(f"✅ {pair} strategy başlatıldı (DÜZELTILMIŞ 1-MIN + CVD)")
+        print(f"   SL: {self.sl_atr_multiplier}×ATR | TP: {self.tp_atr_multiplier}×ATR | R/R: 1:{self.tp_atr_multiplier/self.sl_atr_multiplier:.1f}")
+        print(f"   Fees: {self.taker_fee:.2%} | Trailing Stop: {'✅' if self.use_trailing_stop else '❌'}")
     
     async def on_trade(self, price: float, side: str, amount: float, timestamp: str):
         """Trade'i işle"""
@@ -246,27 +277,72 @@ class PairStrategyWithCVD:
         await self._check_stats_report()
     
     async def _check_open_position(self, current_price: float):
-        """Açık pozisyon kontrol"""
+        """✅ DÜZELTILMIŞ: Açık pozisyon kontrol - Sabit SL/TP + Trailing Stop"""
         if self.position is None:
             return
-        
-        atr = self.indicators.calculate_atr(self.atr_period)
-        if atr == 0:
+
+        # Güvenlik: Entry değerleri yoksa çık
+        if self.stop_loss is None or self.take_profit is None or self.entry_atr is None:
+            print(f"⚠️ [{self.pair}] WARNING: Position açık ama SL/TP tanımlı değil! Pozisyon kapatılıyor.")
+            await self._close_position(current_price, "EMERGENCY EXIT")
             return
-        k1 = 2.0  # SL katsayısı
-        min_edge = 0.0036  # ≈ %0.36 (fee+spread+slip+güvenlik)
 
-        required_k2 = k1 + (current_price * min_edge) / max(atr, 1e-9)
-        k2 = max(3.8, required_k2)  # 3.8×ATR taban, gerekirse yükselt
+        # Trailing Stop Logic
+        if self.use_trailing_stop and self.entry_atr > 0:
+            if self.position == "LONG":
+                # Track highest price
+                if self.highest_price_since_entry is None:
+                    self.highest_price_since_entry = current_price
+                else:
+                    self.highest_price_since_entry = max(self.highest_price_since_entry, current_price)
 
-        stop_loss   = self.entry_price - k1 * atr
-        take_profit = self.entry_price + k2 * atr
+                # Kar yeterli mi? (2×ATR)
+                profit = current_price - self.entry_price
+                trigger_distance = self.trailing_stop_trigger * self.entry_atr
 
-        
-        if current_price >= take_profit:
-            await self._close_position(current_price, "TAKE PROFIT")
-        elif current_price <= stop_loss:
-            await self._close_position(current_price, "STOP LOSS")
+                if profit > trigger_distance:
+                    # Trailing SL hesapla
+                    trailing_sl = self.highest_price_since_entry - (self.trailing_stop_distance * self.entry_atr)
+
+                    # Trailing SL, orijinal SL'den yüksekse güncelle
+                    if trailing_sl > self.stop_loss:
+                        old_sl = self.stop_loss
+                        self.stop_loss = trailing_sl
+                        print(f"   📈 Trailing SL: {old_sl:.2f} → {self.stop_loss:.2f} (High: {self.highest_price_since_entry:.2f})")
+
+            elif self.position == "SHORT":
+                # Track lowest price
+                if self.lowest_price_since_entry is None:
+                    self.lowest_price_since_entry = current_price
+                else:
+                    self.lowest_price_since_entry = min(self.lowest_price_since_entry, current_price)
+
+                # Kar yeterli mi? (2×ATR)
+                profit = self.entry_price - current_price
+                trigger_distance = self.trailing_stop_trigger * self.entry_atr
+
+                if profit > trigger_distance:
+                    # Trailing SL hesapla (SHORT için yukarı)
+                    trailing_sl = self.lowest_price_since_entry + (self.trailing_stop_distance * self.entry_atr)
+
+                    # Trailing SL, orijinal SL'den düşükse güncelle
+                    if trailing_sl < self.stop_loss:
+                        old_sl = self.stop_loss
+                        self.stop_loss = trailing_sl
+                        print(f"   📉 Trailing SL: {old_sl:.2f} → {self.stop_loss:.2f} (Low: {self.lowest_price_since_entry:.2f})")
+
+        # SL/TP Check
+        if self.position == "LONG":
+            if current_price >= self.take_profit:
+                await self._close_position(current_price, "TAKE PROFIT")
+            elif current_price <= self.stop_loss:
+                await self._close_position(current_price, "STOP LOSS")
+
+        elif self.position == "SHORT":
+            if current_price <= self.take_profit:
+                await self._close_position(current_price, "TAKE PROFIT")
+            elif current_price >= self.stop_loss:
+                await self._close_position(current_price, "STOP LOSS")
     
     async def _check_signals(
         self,
@@ -281,109 +357,273 @@ class PairStrategyWithCVD:
         cvd_trend: str,
         buy_ratio: float
     ):
-        """Sinyal kontrolü - CVD ile güçlendirilmiş"""
-        
+        """✅ DÜZELTILMIŞ: Sinyal kontrolü - LONG/SHORT + Fee Check"""
+
         if win_rate < self.win_rate_threshold:
             return
-        
-        # LONG Signal (CVD ile filtreleme)
+
+        if atr <= 0:
+            return
+
+        # Pozisyon yoksa sinyal ara
         if self.position is None:
-            # RSI + Price + CVD
-            # CVD BULLISH (buy volume > sell volume)
-            # CVD momentum pozitif (alıcılar kontrol ediyor)
-            # Buy ratio > 0.55 (alıcılar baskın)
-            
-            rsi_ok = rsi < 50                 # önce 35’ti
-            price_ok = current_price > sma20  # önce > SMA50 ve SMA20'e 0.5*ATR yakın
-            cvd_ok = (
-                cvd_momentum >= 0 and         # >0 yerine >=0
-                buy_ratio > 0.52 and          # 0.55 → 0.52
-                cvd_trend in ["BULLISH", "NEUTRAL"]
+            # ============= LONG SIGNAL =============
+            rsi_ok_long = rsi < self.rsi_oversold
+            price_ok_long = current_price > sma20 and sma20 > sma50  # Uptrend
+            cvd_ok_long = (
+                cvd_momentum > self.cvd_momentum_threshold and
+                buy_ratio > self.buy_ratio_threshold and
+                cvd_trend == "BULLISH"
             )
 
-            if atr > 0 and rsi_ok and price_ok and cvd_ok:
-                self.position = "LONG"
-                self.entry_price = current_price
-                self.entry_time = datetime.now()
-                self.entry_bar_index = len(self.indicators.prices)
-                self.entry_cvd_trend = cvd_trend
-                
-                stop_loss = current_price - atr * 2
-                take_profit = current_price + atr * 3
-                risk = current_price - stop_loss
-                reward = take_profit - current_price
-                risk_reward = reward / risk if risk > 0 else 0
-                
-                print(f"\n🟢 [{self.pair}] LONG ENTRY @ {current_price:.2f}")
-                print(f"   ATR: {atr:.4f} | RSI: {rsi:.1f}")
-                print(f"   CVD Trend: {cvd_trend} | Momentum: {cvd_momentum:+.2f} | Buy: {buy_ratio:.1%}")
-                print(f"   SL: {stop_loss:.2f} | TP: {take_profit:.2f}")
-                print(f"   R:R: 1:{risk_reward:.2f}")
-                
-                if self.notifier:
-                    message = f"""
+            # ============= SHORT SIGNAL =============
+            rsi_ok_short = rsi > self.rsi_overbought
+            price_ok_short = current_price < sma20 and sma20 < sma50  # Downtrend
+            cvd_ok_short = (
+                cvd_momentum < -self.cvd_momentum_threshold and
+                buy_ratio < self.sell_ratio_threshold and
+                cvd_trend == "BEARISH"
+            )
+
+            # LONG Entry
+            if rsi_ok_long and price_ok_long and cvd_ok_long:
+                await self._open_long(current_price, atr, rsi, cvd_trend, cvd_momentum, buy_ratio, sma20, sma50, cvd_delta)
+
+            # SHORT Entry
+            elif rsi_ok_short and price_ok_short and cvd_ok_short:
+                await self._open_short(current_price, atr, rsi, cvd_trend, cvd_momentum, buy_ratio, sma20, sma50, cvd_delta)
+
+    async def _open_long(self, current_price, atr, rsi, cvd_trend, cvd_momentum, buy_ratio, sma20, sma50, cvd_delta):
+        """✅ LONG pozisyon aç - Fee kontrolü ile"""
+        # Entry anındaki ATR'yi sakla
+        self.entry_atr = atr
+
+        # SL/TP hesapla (SABİT - entry anında)
+        self.stop_loss = current_price - (self.sl_atr_multiplier * atr)
+        self.take_profit = current_price + (self.tp_atr_multiplier * atr)
+
+        # Risk/Reward
+        risk = current_price - self.stop_loss
+        reward = self.take_profit - current_price
+        risk_reward = reward / risk if risk > 0 else 0
+
+        # Minimum R/R kontrolü
+        if risk_reward < self.min_risk_reward:
+            print(f"   ⚠️ R/R ({risk_reward:.2f}) < Min R/R ({self.min_risk_reward:.2f}) - LONG İPTAL")
+            return
+
+        # Fee + Slippage kontrolü
+        total_fee = (self.taker_fee * 2) + (self.slippage * 2)  # Entry + Exit
+        min_profit_pct = total_fee + 0.001  # +%0.1 güvenlik marjı
+        expected_profit_pct = reward / current_price
+
+        if expected_profit_pct < min_profit_pct:
+            print(f"   ⚠️ Expected profit ({expected_profit_pct:.2%}) < Min profit ({min_profit_pct:.2%}) - LONG İPTAL")
+            return
+
+        # Pozisyon aç
+        self.position = "LONG"
+        self.entry_price = current_price
+        self.entry_time = datetime.now()
+        self.entry_bar_index = len(self.indicators.prices)
+        self.entry_cvd_trend = cvd_trend
+        self.highest_price_since_entry = current_price
+
+        print(f"\n🟢 [{self.pair}] LONG ENTRY @ {current_price:.2f}")
+        print(f"   ATR: {atr:.4f} (FIXED) | RSI: {rsi:.1f}")
+        print(f"   SL: {self.stop_loss:.2f} (-{self.sl_atr_multiplier}×ATR) | TP: {self.take_profit:.2f} (+{self.tp_atr_multiplier}×ATR)")
+        print(f"   R:R: 1:{risk_reward:.2f} | Expected Profit: {expected_profit_pct:.2%} (Min: {min_profit_pct:.2%})")
+        print(f"   CVD: {cvd_trend} | Momentum: {cvd_momentum:+.2f} | Buy: {buy_ratio:.1%}")
+
+        if self.notifier:
+            message = f"""
 <b>🟢 LONG ENTRY - {self.pair}</b>
 
 <b>Price:</b> {current_price:.2f}
-<b>Stop Loss:</b> {stop_loss:.2f}
-<b>Take Profit:</b> {take_profit:.2f}
+<b>Stop Loss:</b> {self.stop_loss:.2f} (-{self.sl_atr_multiplier}×ATR)
+<b>Take Profit:</b> {self.take_profit:.2f} (+{self.tp_atr_multiplier}×ATR)
 <b>Risk/Reward:</b> 1:{risk_reward:.2f}
 
 <b>Indicators:</b>
 ├─ RSI: {rsi:.1f}
-├─ ATR: {atr:.4f}
+├─ ATR: {atr:.4f} (FIXED)
 ├─ SMA20: {sma20:.2f}
 └─ SMA50: {sma50:.2f}
 
-<b>Volume Indicators:</b>
+<b>Volume Analysis:</b>
 ├─ CVD Trend: {cvd_trend}
 ├─ CVD Momentum: {cvd_momentum:+.2f}
 ├─ Buy Ratio: {buy_ratio:.1%}
 └─ CVD Delta: {cvd_delta:+.2f}
 
-<i>⏰ {datetime.now().strftime('%H:%M:%S')}</i>
-"""
-                    await self.notifier.send(message, AlertLevel.TRADE)
-    
-    async def _close_position(self, exit_price: float, exit_type: str):
-        """Pozisyonu kapat"""
-        pnl = exit_price - self.entry_price
-        pnl_pct = (pnl / self.entry_price) * 100
-        duration = (datetime.now() - self.entry_time).total_seconds()
-        
-        emoji = "🟢" if pnl > 0 else "🔴"
-        bars_held = len(self.indicators.prices) - self.entry_bar_index
-        
-        print(f"\n{emoji} [{self.pair}] LONG EXIT ({exit_type}) @ {exit_price:.2f}")
-        print(f"   PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
-        print(f"   Bars: {bars_held} | Duration: {duration:.0f}s")
-        
-        self.stats.add_trade(
-            entry_price=self.entry_price,
-            exit_price=exit_price,
-            pnl=pnl,
-            pnl_pct=pnl_pct,
-            duration_sec=duration,
-            trade_type="LONG",
-            entry_time=self.entry_time,
-            exit_time=datetime.now()
-        )
-        
-        if self.notifier:
-            message = f"""
-<b>{emoji} LONG EXIT - {self.pair}</b>
-
-<b>Entry:</b> {self.entry_price:.2f}
-<b>Exit:</b> {exit_price:.2f}
-<b>PnL:</b> {pnl:+.2f} ({pnl_pct:+.2f}%)
-<b>Duration:</b> {duration:.0f}s ({bars_held} bars)
-<b>Exit Type:</b> {exit_type}
+<b>Fees:</b> {total_fee:.2%} | <b>Expected:</b> {expected_profit_pct:.2%}
 
 <i>⏰ {datetime.now().strftime('%H:%M:%S')}</i>
 """
             await self.notifier.send(message, AlertLevel.TRADE)
-        
+
+    async def _open_short(self, current_price, atr, rsi, cvd_trend, cvd_momentum, buy_ratio, sma20, sma50, cvd_delta):
+        """✅ SHORT pozisyon aç - Fee kontrolü ile"""
+        # Entry anındaki ATR'yi sakla
+        self.entry_atr = atr
+
+        # SL/TP hesapla (SHORT için ters yönde)
+        self.stop_loss = current_price + (self.sl_atr_multiplier * atr)
+        self.take_profit = current_price - (self.tp_atr_multiplier * atr)
+
+        # Risk/Reward
+        risk = self.stop_loss - current_price
+        reward = current_price - self.take_profit
+        risk_reward = reward / risk if risk > 0 else 0
+
+        # Minimum R/R kontrolü
+        if risk_reward < self.min_risk_reward:
+            print(f"   ⚠️ R/R ({risk_reward:.2f}) < Min R/R ({self.min_risk_reward:.2f}) - SHORT İPTAL")
+            return
+
+        # Fee + Slippage kontrolü
+        total_fee = (self.taker_fee * 2) + (self.slippage * 2)
+        min_profit_pct = total_fee + 0.001
+        expected_profit_pct = reward / current_price
+
+        if expected_profit_pct < min_profit_pct:
+            print(f"   ⚠️ Expected profit ({expected_profit_pct:.2%}) < Min profit ({min_profit_pct:.2%}) - SHORT İPTAL")
+            return
+
+        # Pozisyon aç
+        self.position = "SHORT"
+        self.entry_price = current_price
+        self.entry_time = datetime.now()
+        self.entry_bar_index = len(self.indicators.prices)
+        self.entry_cvd_trend = cvd_trend
+        self.lowest_price_since_entry = current_price
+
+        print(f"\n🔴 [{self.pair}] SHORT ENTRY @ {current_price:.2f}")
+        print(f"   ATR: {atr:.4f} (FIXED) | RSI: {rsi:.1f}")
+        print(f"   SL: {self.stop_loss:.2f} (+{self.sl_atr_multiplier}×ATR) | TP: {self.take_profit:.2f} (-{self.tp_atr_multiplier}×ATR)")
+        print(f"   R:R: 1:{risk_reward:.2f} | Expected Profit: {expected_profit_pct:.2%} (Min: {min_profit_pct:.2%})")
+        print(f"   CVD: {cvd_trend} | Momentum: {cvd_momentum:+.2f} | Buy: {buy_ratio:.1%}")
+
+        if self.notifier:
+            message = f"""
+<b>🔴 SHORT ENTRY - {self.pair}</b>
+
+<b>Price:</b> {current_price:.2f}
+<b>Stop Loss:</b> {self.stop_loss:.2f} (+{self.sl_atr_multiplier}×ATR)
+<b>Take Profit:</b> {self.take_profit:.2f} (-{self.tp_atr_multiplier}×ATR)
+<b>Risk/Reward:</b> 1:{risk_reward:.2f}
+
+<b>Indicators:</b>
+├─ RSI: {rsi:.1f}
+├─ ATR: {atr:.4f} (FIXED)
+├─ SMA20: {sma20:.2f}
+└─ SMA50: {sma50:.2f}
+
+<b>Volume Analysis:</b>
+├─ CVD Trend: {cvd_trend}
+├─ CVD Momentum: {cvd_momentum:+.2f}
+├─ Buy Ratio: {buy_ratio:.1%}
+└─ CVD Delta: {cvd_delta:+.2f}
+
+<b>Fees:</b> {total_fee:.2%} | <b>Expected:</b> {expected_profit_pct:.2%}
+
+<i>⏰ {datetime.now().strftime('%H:%M:%S')}</i>
+"""
+            await self.notifier.send(message, AlertLevel.TRADE)
+    
+    async def _close_position(self, exit_price: float, exit_type: str):
+        """✅ DÜZELTILMIŞ: Pozisyonu kapat - NET PnL hesaplama (Fee + Slippage)"""
+
+        # Güvenlik kontrolü
+        if self.entry_price is None or self.entry_time is None:
+            print(f"⚠️ [{self.pair}] ERROR: Entry bilgileri eksik!")
+            self.position = None
+            return
+
+        # GROSS PnL (fee olmadan)
+        if self.position == "LONG":
+            gross_pnl = exit_price - self.entry_price
+        elif self.position == "SHORT":
+            gross_pnl = self.entry_price - exit_price
+        else:
+            gross_pnl = 0
+
+        gross_pnl_pct = (gross_pnl / self.entry_price) * 100
+
+        # ✅ NET PnL (Fee + Slippage dahil)
+        # Entry: price × (1 + taker_fee + slippage)
+        # Exit: price × (1 - taker_fee - slippage)
+        if self.position == "LONG":
+            entry_cost = self.entry_price * (1 + self.taker_fee + self.slippage)
+            exit_revenue = exit_price * (1 - self.taker_fee - self.slippage)
+            net_pnl = exit_revenue - entry_cost
+        elif self.position == "SHORT":
+            entry_revenue = self.entry_price * (1 - self.taker_fee - self.slippage)
+            exit_cost = exit_price * (1 + self.taker_fee + self.slippage)
+            net_pnl = entry_revenue - exit_cost
+        else:
+            net_pnl = 0
+
+        net_pnl_pct = (net_pnl / self.entry_price) * 100
+        fee_cost = gross_pnl - net_pnl
+        fee_cost_pct = (fee_cost / self.entry_price) * 100
+
+        duration = (datetime.now() - self.entry_time).total_seconds()
+        bars_held = len(self.indicators.prices) - self.entry_bar_index if self.entry_bar_index else 0
+
+        emoji = "🟢" if net_pnl > 0 else "🔴"
+        pos_type = self.position if self.position else "UNKNOWN"
+
+        print(f"\n{emoji} [{self.pair}] {pos_type} EXIT ({exit_type}) @ {exit_price:.2f}")
+        print(f"   Entry: {self.entry_price:.2f} | Exit: {exit_price:.2f}")
+        print(f"   GROSS PnL: {gross_pnl:+.2f} ({gross_pnl_pct:+.2f}%)")
+        print(f"   NET PnL: {net_pnl:+.2f} ({net_pnl_pct:+.2f}%) ← FEES INCLUDED")
+        print(f"   Fee Cost: {fee_cost:.2f} ({fee_cost_pct:.2%})")
+        print(f"   SL: {self.stop_loss:.2f} | TP: {self.take_profit:.2f}")
+        print(f"   Bars: {bars_held} | Duration: {duration:.0f}s")
+
+        # Stats'e NET PnL ekle
+        self.stats.add_trade(
+            entry_price=self.entry_price,
+            exit_price=exit_price,
+            pnl=net_pnl,  # ← NET PnL!
+            pnl_pct=net_pnl_pct,  # ← NET PnL %!
+            duration_sec=duration,
+            trade_type=pos_type,
+            entry_time=self.entry_time,
+            exit_time=datetime.now()
+        )
+
+        if self.notifier:
+            message = f"""
+<b>{emoji} {pos_type} EXIT - {self.pair}</b>
+
+<b>Entry:</b> {self.entry_price:.2f}
+<b>Exit:</b> {exit_price:.2f}
+<b>Exit Type:</b> {exit_type}
+
+<b>PnL (GROSS):</b> {gross_pnl:+.2f} ({gross_pnl_pct:+.2f}%)
+<b>PnL (NET):</b> {net_pnl:+.2f} ({net_pnl_pct:+.2f}%)
+<b>Fee Cost:</b> {fee_cost:.2f} ({fee_cost_pct:.2%})
+
+<b>Duration:</b> {duration:.0f}s ({bars_held} bars)
+<b>SL:</b> {self.stop_loss:.2f} | <b>TP:</b> {self.take_profit:.2f}
+
+<i>⏰ {datetime.now().strftime('%H:%M:%S')}</i>
+"""
+            await self.notifier.send(message, AlertLevel.TRADE)
+
+        # ✅ Pozisyonu tamamen sıfırla
         self.position = None
+        self.entry_price = None
+        self.entry_time = None
+        self.entry_bar_index = None
+        self.entry_cvd_trend = None
+        self.entry_atr = None
+        self.stop_loss = None
+        self.take_profit = None
+        self.highest_price_since_entry = None
+        self.lowest_price_since_entry = None
     
     async def _check_stats_report(self):
         now = datetime.now()
@@ -492,44 +732,66 @@ async def main():
     import os
     telegram_token = ""
     telegram_chat_id = ""
-    
+
+    # ✅ DÜZELTILMIŞ: Daha liquid pairler (yüksek volume)
+    # Tier 1: En yüksek volume (önerilir)
+    # pairs = ["BTCTRY", "ETHTRY", "SOLTRY", "AVXTRY"]
+
+    # Tier 2: Orta volume
+    # pairs = ["USDTTRY", "LINKTRY", "DOGETRY"]
+
+    # Test için (düşük volume - DİKKAT!)
+    pairs = ["UNITRY", "CVCTRY", "SPELLTRY"]
+
     # Strategy
     strategy = HighSharpeStrategyWithCVD(
-        pairs=["UNITRY", "CVCTRY","SPELLTRY"],
+        pairs=pairs,
         telegram_token=telegram_token,
         telegram_chat_id=telegram_chat_id,
-        stats_report_interval=360
+        stats_report_interval=3600
     )
-    
+
     # Feed
     feed = BTCTurkTradeFeed(
-        pairs=["UNITRY", "CVCTRY","SPELLTRY"],
+        pairs=pairs,
         on_trade=strategy.on_trade
     )
-    
-    print(f"\n{'='*70}")
-    print(f"🚀 HIGH SHARPE STRATEGY - 1-MIN BARS + CVD VOLUME MOMENTUM")
-    print(f"{'='*70}")
-    print(f"Pairs: BTCTRY, ETHTRY")
+
+    print(f"\n{'='*80}")
+    print(f"🚀 DÜZELTILMIŞ STRATEGY - 1-MIN BARS + CVD + TRAILING STOP")
+    print(f"{'='*80}")
+    print(f"Pairs: {', '.join(pairs)}")
     print(f"Period: 1 minute (OHLCV)")
-    print(f"Volume Indicator: CVD (Cumulative Volume Delta)")
-    print(f"Indicators: ✅ ATR + RSI + SMA + CVD")
-    print(f"Features:")
-    print(f"  • Price action (RSI, ATR, SMA)")
-    print(f"  • Volume momentum (CVD, Buy Ratio)")
-    print(f"  • Multi-pair support")
-    print(f"  • Telegram alerts")
+    print(f"")
+    print(f"✅ ÖNEMLİ DÜZELTMELER:")
+    print(f"  • Sabit SL/TP (entry anında hesaplanıp SABİTLENİR)")
+    print(f"  • NET PnL hesaplama (Fee + Slippage dahil)")
+    print(f"  • Trailing Stop (2×ATR kar sonra aktif)")
+    print(f"  • LONG + SHORT pozisyon desteği")
+    print(f"  • Minimum R/R kontrolü (1:1.5)")
+    print(f"  • Fee kontrolü (beklenen kar > fee)")
+    print(f"")
+    print(f"Indicators: ATR + RSI + SMA + CVD")
+    print(f"SL/TP: 2×ATR / 3×ATR (R/R = 1:1.5)")
+    print(f"Fees: 0.16% (taker) + 0.05% (slippage) = ~0.42% total")
     print(f"Telegram: {'✅ Enabled' if strategy.notifier else '❌ Disabled'}")
-    await strategy.notifier.send(
-    f"<b>🚀 Strategy started</b>\nPairs: {', '.join(strategy.pairs)}",AlertLevel.STATS)
-    print(f"{'='*70}\n")
-    
+    print(f"{'='*80}\n")
+
+    if strategy.notifier:
+        await strategy.notifier.send(
+            f"<b>🚀 DÜZELTILMIŞ Strategy Started</b>\n\n"
+            f"<b>Pairs:</b> {', '.join(strategy.pairs)}\n"
+            f"<b>Features:</b> Sabit SL/TP, NET PnL, Trailing Stop, LONG/SHORT\n"
+            f"<b>R/R:</b> 1:1.5 | <b>Fees:</b> ~0.42%",
+            AlertLevel.STATS
+        )
+
     feed_task = asyncio.create_task(feed.start())
-    
+
     try:
         while True:
             await asyncio.sleep(60)
-    
+
     except KeyboardInterrupt:
         print("\n⛔ Stopping...")
         strategy.print_all_summaries()
