@@ -62,9 +62,19 @@ pip install websockets pandas numpy binance-connector python-telegram-bot reques
 TELEGRAM_BOT_TOKEN = "123456:ABC-DEF..."  # Bot token
 TELEGRAM_CHAT_ID = "123456789"            # Chat ID
 
-SYMBOLS = ["SOLUSDT", "BTCUSDT", "ETHUSDT"]  # İzlenecek coinler
+# Dinamik Sembol Seçimi (Otomatik)
+MAX_SYMBOLS = 5  # Maksimum izlenecek coin sayısı
+MIN_FUNDING_RATE = 0.0003  # Minimum funding rate (0.03% per 8h)
+UPDATE_SYMBOLS_INTERVAL = 3600  # Sembol listesini güncelleme sıklığı (saniye)
+
 POSITION_SIZE_USD = 1000  # Pozisyon büyüklüğü
 ```
+
+**NOT:** Artık manuel olarak `SYMBOLS` listesi belirtmeye gerek yok! Sistem otomatik olarak:
+- Tüm USDT perpetual kontratları tarar
+- En yüksek funding rate'e sahip coin'leri seçer
+- Her saat listeyi günceller
+- Daha karlı fırsatlar çıkarsa otomatik değiştirir
 
 ### 4. Çalıştır:
 ```bash
@@ -78,6 +88,11 @@ python funding_cvd_system.py
 ### Temel Parametreler:
 
 ```python
+# Dinamik Sembol Seçimi
+MAX_SYMBOLS = 5  # Maksimum izlenecek coin sayısı (1-10 arası önerilir)
+MIN_FUNDING_RATE = 0.0003  # Minimum funding rate (0.03% per 8h)
+UPDATE_SYMBOLS_INTERVAL = 3600  # Güncelleme sıklığı (saniye, 3600 = 1 saat)
+
 # Trading Parameters
 POSITION_SIZE_USD = 1000  # Her coin için pozisyon büyüklüğü
 
@@ -89,6 +104,29 @@ SLIPPAGE = 0.0005          # 0.05%
 # Signal Thresholds
 FUNDING_Z_THRESHOLD = 2.0      # Funding spike z-score
 CVD_CHANGE_THRESHOLD = 10000   # Significant CVD change
+```
+
+### Dinamik Sembol Seçimi Ayarları:
+
+**Conservative (Az coin, sadece en iyiler):**
+```python
+MAX_SYMBOLS = 3  # Sadece top 3
+MIN_FUNDING_RATE = 0.0005  # En az 0.05% (yüksek threshold)
+UPDATE_SYMBOLS_INTERVAL = 7200  # Her 2 saatte güncelle
+```
+
+**Moderate (Dengeli - Varsayılan):**
+```python
+MAX_SYMBOLS = 5  # Top 5 coin
+MIN_FUNDING_RATE = 0.0003  # En az 0.03%
+UPDATE_SYMBOLS_INTERVAL = 3600  # Her saat güncelle
+```
+
+**Aggressive (Çok coin, daha fazla fırsat):**
+```python
+MAX_SYMBOLS = 8  # Top 8 coin
+MIN_FUNDING_RATE = 0.0002  # En az 0.02% (düşük threshold)
+UPDATE_SYMBOLS_INTERVAL = 1800  # Her 30 dakika güncelle
 ```
 
 ### Threshold'ları Ayarlama:
@@ -109,6 +147,62 @@ CVD_CHANGE_THRESHOLD = 10000  # Default
 ```python
 FUNDING_Z_THRESHOLD = 1.5
 CVD_CHANGE_THRESHOLD = 5000
+```
+
+---
+
+## 🔄 Dinamik Sembol Seçimi
+
+### Nasıl Çalışır?
+
+Sistem başlatıldığında ve her saat başı:
+
+1. **Tarama:** Binance'deki tüm USDT perpetual kontratları taranır (~200+ coin)
+2. **Filtreleme:** Minimum funding rate threshold'ını geçen coin'ler seçilir
+3. **Sıralama:** Absolute funding rate'e göre sıralanır (hem pozitif hem negatif)
+4. **Seçim:** En yüksek funding'e sahip top N coin seçilir
+5. **Güncelleme:** Liste değiştiyse WebSocket yeniden bağlanır ve Telegram bildirimi gönderilir
+
+### Avantajları:
+
+✅ **Otomatik Optimizasyon:** Manuel olarak coin seçmeye gerek yok
+✅ **Fırsat Yakalama:** Yeni yüksek funding fırsatlarını otomatik yakalar
+✅ **Risk Azaltma:** Funding düşen coin'lerden otomatik çıkar
+✅ **Zaman Tasarrufu:** Sürekli funding rate taraması yapmana gerek yok
+✅ **Diversifikasyon:** Her zaman en karlı coin portfolio'su
+
+### Örnek Senaryo:
+
+```
+Saat 10:00 - İlk Tarama:
+  SOLUSDT: +0.15%
+  AVAXUSDT: +0.12%
+  ARBUSDT: +0.10%
+  → Bu 3 coin izleniyor
+
+Saat 11:00 - Güncelleme:
+  PEPEUSDT: +0.18% (YENİ YÜKSEK!)
+  SOLUSDT: +0.14% (hala iyi)
+  AVAXUSDT: +0.11% (hala iyi)
+  ARBUSDT: +0.05% (düştü)
+
+  → ARBUSDT çıkar, PEPEUSDT girer
+  → Telegram bildirimi gelir
+  → WebSocket yeniden bağlanır
+```
+
+### Manuel Mod:
+
+Eğer yine de manuel sembol seçmek istiyorsan:
+
+```python
+# update_symbols() metodunu devre dışı bırak
+# WebSocketManager.__init__ içinde:
+self.symbols = ["BTCUSDT", "ETHUSDT"]  # Manuel liste
+
+# connect_and_listen() içindeki update check'i kaldır:
+# if (datetime.now() - self.last_symbol_update).total_seconds() > UPDATE_SYMBOLS_INTERVAL:
+#     ...
 ```
 
 ---
@@ -321,7 +415,8 @@ $1,000 sermaye için:
 **Strategi:**
 ```python
 POSITION_SIZE_USD = 250  # Per coin
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]  # Sadece stable coinler
+MAX_SYMBOLS = 2  # Sadece top 2 coin
+MIN_FUNDING_RATE = 0.0005  # Yüksek funding'leri seç (0.05%+)
 ```
 
 **Beklenti:**
@@ -334,6 +429,7 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT"]  # Sadece stable coinler
 - Funding nasıl değişiyor gözle
 - CVD pattern'leri öğren
 - Execution practice yap
+- Sistem otomatik olarak en iyi 2 coin'i seçecek
 
 ---
 
@@ -342,7 +438,9 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT"]  # Sadece stable coinler
 **Strateji:**
 ```python
 POSITION_SIZE_USD = 500  # Per coin
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+MAX_SYMBOLS = 4  # Top 4 coin
+MIN_FUNDING_RATE = 0.0004  # 0.04%+ funding
+UPDATE_SYMBOLS_INTERVAL = 3600  # Her saat güncelle
 ```
 
 **Beklenti:**
@@ -351,9 +449,9 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 - Risk: Düşük-Orta
 
 **Taktik:**
-- 4 coin diversify
+- 4 coin otomatik diversify
 - High funding'de aggressive ol
-- Low funding'de wait & watch
+- Sistem en karlı coin'lere otomatik geçer
 
 ---
 
@@ -362,7 +460,9 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 **Strateji:**
 ```python
 POSITION_SIZE_USD = 1000  # Per coin
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "MATICUSDT"]
+MAX_SYMBOLS = 5  # Top 5 coin
+MIN_FUNDING_RATE = 0.0003  # 0.03%+ funding
+UPDATE_SYMBOLS_INTERVAL = 1800  # Her 30 dakika güncelle
 ```
 
 **Beklenti:**
@@ -371,9 +471,10 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "MATICUSDT"]
 - Risk: Orta
 
 **Advanced Taktikler:**
-- Dynamic position sizing (high funding = larger size)
-- Multi-timeframe analysis
-- Correlation hedging
+- Dynamic symbol rotation (sistem otomatik)
+- Multi-symbol correlation tracking
+- Frequent updates (30 dakika)
+- Telegram'dan güncellemeleri takip et
 
 ---
 
@@ -436,7 +537,48 @@ LAST 5 BARS (1-minute):
 Monitoring funding rates and order flow...
 ```
 
-### 2. Signal Notification:
+Ardından ilk sembol taraması yapılır ve en iyi fırsatlar bildirilir:
+```
+📊 Top Funding Opportunities
+
+🔴 SHORT SOLUSDT
+  • Funding: +0.0850% per 8h
+  • Daily: $2.55
+  • Payback: 0.7 days
+
+🔴 SHORT AVAXUSDT
+  • Funding: +0.0720% per 8h
+  • Daily: $2.16
+  • Payback: 0.8 days
+
+🟢 LONG MATICUSDT
+  • Funding: -0.0650% per 8h
+  • Daily: $1.95
+  • Payback: 0.9 days
+```
+
+### 2. Sembol Listesi Güncelleme (Her Saat):
+```
+🔄 Symbol List Updated
+
+❌ Removed (lower funding):
+  • ETHUSDT
+  • BNBUSDT
+
+✅ Added (higher funding):
+  • PEPEUSDT
+  • ARBUSDT
+
+Now monitoring: SOLUSDT, BTCUSDT, PEPEUSDT, ARBUSDT, AVAXUSDT
+```
+
+**Ne Anlama Gelir:**
+- Sistem otomatik olarak daha karlı coin'lere geçiyor
+- Eski coin'lerin funding'i düştü
+- Yeni coin'lerin funding'i daha yüksek
+- WebSocket yeniden bağlanacak (seamless)
+
+### 3. Signal Notification:
 ```
 🔴 SHORT SIGNAL: SOLUSDT
 
@@ -453,7 +595,7 @@ Monitoring funding rates and order flow...
 ⏰ Time: 2025-01-13 15:30:00
 ```
 
-### 3. Hourly Summary:
+### 4. Hourly Summary:
 ```
 📊 Funding Rate Summary
 
