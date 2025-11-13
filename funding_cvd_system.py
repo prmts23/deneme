@@ -47,7 +47,9 @@ TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
 # Trading Parameters
-SYMBOLS = ["SOLUSDT", "BTCUSDT", "ETHUSDT"]  # Symbols to monitor
+MAX_SYMBOLS = 5  # Maximum number of symbols to monitor simultaneously
+MIN_FUNDING_RATE = 0.0003  # Minimum funding rate to consider (0.03% per 8h)
+UPDATE_SYMBOLS_INTERVAL = 3600  # Update symbol list every hour (seconds)
 POSITION_SIZE_USD = 1000  # Position size for calculations
 
 # Fees and Slippage
@@ -113,6 +115,117 @@ class Signal:
     payback_days: float
 
 # ====================================================================
+# SYMBOL SCANNER (Dynamic Symbol Selection)
+# ====================================================================
+
+class SymbolScanner:
+    """Scan and select symbols with highest funding rates"""
+
+    def __init__(self, client: Client):
+        self.client = client
+
+    def get_all_usdt_perpetuals(self) -> List[str]:
+        """Get all USDT-M perpetual symbols"""
+        try:
+            exchange_info = self.client.futures_exchange_info()
+            symbols = []
+            for symbol_info in exchange_info["symbols"]:
+                if (
+                    symbol_info.get("contractType") == "PERPETUAL"
+                    and symbol_info.get("quoteAsset") == "USDT"
+                    and symbol_info.get("status") == "TRADING"
+                ):
+                    symbols.append(symbol_info["symbol"])
+            return symbols
+        except Exception as e:
+            logger.error(f"Error fetching symbols: {e}")
+            return []
+
+    def get_funding_rate(self, symbol: str) -> Optional[float]:
+        """Get current funding rate for a symbol"""
+        try:
+            funding_data = self.client.futures_funding_rate(symbol=symbol, limit=1)
+            if funding_data:
+                return float(funding_data[0]["fundingRate"])
+            return None
+        except Exception as e:
+            logger.debug(f"Error getting funding for {symbol}: {e}")
+            return None
+
+    def scan_top_funding_symbols(
+        self,
+        max_symbols: int = MAX_SYMBOLS,
+        min_funding: float = MIN_FUNDING_RATE
+    ) -> List[Tuple[str, float]]:
+        """
+        Scan all symbols and return top N by funding rate
+
+        Returns:
+            List of (symbol, funding_rate) tuples, sorted by funding rate descending
+        """
+        logger.info("🔍 Scanning all USDT perpetuals for highest funding rates...")
+
+        # Get all symbols
+        all_symbols = self.get_all_usdt_perpetuals()
+        logger.info(f"Found {len(all_symbols)} USDT perpetual contracts")
+
+        # Get funding rates
+        symbol_funding = []
+        for symbol in all_symbols:
+            funding = self.get_funding_rate(symbol)
+            if funding is not None and abs(funding) >= min_funding:
+                symbol_funding.append((symbol, funding))
+
+        # Sort by absolute funding rate (we can trade both positive and negative)
+        # But prefer positive funding (short positions collect funding)
+        symbol_funding.sort(key=lambda x: abs(x[1]), reverse=True)
+
+        # Take top N
+        top_symbols = symbol_funding[:max_symbols]
+
+        # Log results
+        logger.info(f"\n{'='*80}")
+        logger.info(f"📊 TOP {len(top_symbols)} FUNDING OPPORTUNITIES:")
+        logger.info(f"{'='*80}")
+        for symbol, funding in top_symbols:
+            direction = "SHORT (collect)" if funding > 0 else "LONG (collect)"
+            daily_rate = funding * 3 * 100  # 3 times per day, as percentage
+            logger.info(f"  {symbol:12s} | Funding: {funding*100:+.4f}% | "
+                       f"Daily: {daily_rate:+.3f}% | {direction}")
+        logger.info(f"{'='*80}\n")
+
+        return top_symbols
+
+    def calculate_expected_profit(
+        self,
+        symbol: str,
+        funding_rate: float,
+        position_size: float = POSITION_SIZE_USD
+    ) -> Dict:
+        """Calculate expected profit for a symbol"""
+        # Daily funding (3 times per day)
+        daily_funding = funding_rate * position_size * 3
+
+        # Fees
+        round_trip_fees, _ = FeeCalculator.calculate_round_trip_fees(position_size)
+
+        # Payback period
+        if daily_funding <= 0:
+            payback_days = float('inf')
+        else:
+            payback_days = round_trip_fees / daily_funding
+
+        return {
+            "symbol": symbol,
+            "funding_rate": funding_rate,
+            "daily_profit": daily_funding,
+            "monthly_profit": daily_funding * 30,
+            "annual_apy": (daily_funding * 365 / position_size) * 100,
+            "round_trip_fees": round_trip_fees,
+            "payback_days": payback_days
+        }
+
+# ====================================================================
 # TELEGRAM NOTIFIER
 # ====================================================================
 
@@ -175,6 +288,31 @@ class TelegramNotifier:
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
+        return self.send_message(message)
+
+    def send_symbol_update(self, old_symbols: List[str], new_symbols: List[str]) -> bool:
+        """Send notification when monitored symbols change"""
+        removed = set(old_symbols) - set(new_symbols)
+        added = set(new_symbols) - set(old_symbols)
+
+        if not removed and not added:
+            return False
+
+        message = "🔄 <b>Symbol List Updated</b>\n\n"
+
+        if removed:
+            message += "<b>❌ Removed (lower funding):</b>\n"
+            for sym in removed:
+                message += f"  • {sym}\n"
+            message += "\n"
+
+        if added:
+            message += "<b>✅ Added (higher funding):</b>\n"
+            for sym in added:
+                message += f"  • {sym}\n"
+
+        message += f"\n<b>Now monitoring:</b> {', '.join(new_symbols)}"
+
         return self.send_message(message)
 
 # ====================================================================
@@ -525,17 +663,68 @@ class SignalGenerator:
 class WebSocketManager:
     """Manage WebSocket connections and data flow"""
 
-    def __init__(self, symbols: List[str], telegram_notifier: TelegramNotifier):
-        self.symbols = symbols
+    def __init__(self, telegram_notifier: TelegramNotifier):
+        self.symbols = []  # Will be populated dynamically
         self.processor = DataProcessor()
         self.telegram = telegram_notifier
         self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+        self.scanner = SymbolScanner(self.client)
         self.running = False
         self.event_count = 0
         self.last_summary_time = datetime.now()
+        self.last_symbol_update = datetime.now()
+        self.websocket = None  # Current WebSocket connection
+
+    def update_symbols(self) -> bool:
+        """
+        Update symbol list based on current funding rates
+
+        Returns:
+            True if symbols changed, False otherwise
+        """
+        # Scan for top funding symbols
+        top_funding = self.scanner.scan_top_funding_symbols(
+            max_symbols=MAX_SYMBOLS,
+            min_funding=MIN_FUNDING_RATE
+        )
+
+        # Extract symbol names
+        new_symbols = [symbol for symbol, _ in top_funding]
+
+        # Check if changed
+        if set(new_symbols) == set(self.symbols):
+            logger.info("✓ Symbol list unchanged")
+            return False
+
+        # Send Telegram notification
+        if self.symbols:  # Not first time
+            self.telegram.send_symbol_update(self.symbols, new_symbols)
+
+        # Send funding summary to Telegram
+        summary_msg = "📊 <b>Top Funding Opportunities</b>\n\n"
+        for symbol, funding in top_funding:
+            profit_info = self.scanner.calculate_expected_profit(symbol, funding)
+            direction = "🔴 SHORT" if funding > 0 else "🟢 LONG"
+            summary_msg += f"{direction} <b>{symbol}</b>\n"
+            summary_msg += f"  • Funding: {funding*100:+.4f}% per 8h\n"
+            summary_msg += f"  • Daily: ${profit_info['daily_profit']:.2f}\n"
+            summary_msg += f"  • Payback: {profit_info['payback_days']:.1f} days\n\n"
+
+        self.telegram.send_message(summary_msg)
+
+        # Update symbols
+        old_symbols = self.symbols
+        self.symbols = new_symbols
+
+        logger.info(f"✓ Updated symbols: {', '.join(new_symbols)}")
+
+        return True
 
     def build_stream_url(self) -> str:
         """Build WebSocket URL for multiple symbols"""
+        if not self.symbols:
+            raise ValueError("No symbols to monitor")
+
         streams = []
         for symbol in self.symbols:
             sym_lower = symbol.lower()
@@ -695,21 +884,42 @@ class WebSocketManager:
 
     async def connect_and_listen(self):
         """Connect to WebSocket and listen for messages"""
-        url = self.build_stream_url()
-        logger.info(f"Connecting to: {url}")
+        # Initial symbol update
+        self.update_symbols()
 
         while self.running:
             try:
+                # Build URL with current symbols
+                url = self.build_stream_url()
+                logger.info(f"Connecting to: {url}")
+
                 async with websockets.connect(url) as websocket:
+                    self.websocket = websocket
                     logger.info("✅ WebSocket connected")
 
                     # Send connection notification
-                    self.telegram.send_message("🟢 <b>Funding CVD System Started</b>\n\nMonitoring funding rates and order flow...")
+                    if not self.last_symbol_update or (datetime.now() - self.last_symbol_update).total_seconds() < 10:
+                        self.telegram.send_message("🟢 <b>Funding CVD System Started</b>\n\nMonitoring funding rates and order flow...")
 
                     while self.running:
-                        message = await websocket.recv()
-                        data = json.loads(message)
-                        await self.process_message(data)
+                        # Check if symbols need updating
+                        if (datetime.now() - self.last_symbol_update).total_seconds() > UPDATE_SYMBOLS_INTERVAL:
+                            logger.info("⏰ Time to update symbols...")
+                            symbols_changed = self.update_symbols()
+                            self.last_symbol_update = datetime.now()
+
+                            if symbols_changed:
+                                logger.info("🔄 Symbols changed, reconnecting WebSocket...")
+                                break  # Break to reconnect with new symbols
+
+                        # Receive message with timeout
+                        try:
+                            message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                            data = json.loads(message)
+                            await self.process_message(data)
+                        except asyncio.TimeoutError:
+                            # Timeout is normal, just check for symbol updates
+                            continue
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("❌ WebSocket connection closed. Reconnecting in 5 seconds...")
@@ -737,7 +947,7 @@ async def main():
     """Main entry point"""
     # Initialize components
     telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-    ws_manager = WebSocketManager(SYMBOLS, telegram)
+    ws_manager = WebSocketManager(telegram)
 
     try:
         # Start system
