@@ -68,6 +68,11 @@ BUFFER_SIZE = 1000  # Number of events to buffer
 UPDATE_INTERVAL = 3600  # Symbol update interval (1 hour)
 REGIME_LOG_FILE = "regime_stats.csv"
 SIGNAL_LOG_FILE = "regime_signals.csv"
+TRADE_LOG_FILE = "regime_trades.csv"  # Actual P&L results
+
+# System Behavior
+WARMUP_PERIOD_MINUTES = 15  # Collect data before generating signals
+POSITION_SIZE_USD = 1000  # Position size for P&L calculation
 
 # Logging
 logging.basicConfig(
@@ -125,6 +130,23 @@ class RegimeSignal:
     entry_reason: str
     expected_holding_days: float
     notes: str
+
+@dataclass
+class Trade:
+    """Actual trade execution and result"""
+    entry_time: datetime
+    exit_time: Optional[datetime]
+    symbol: str
+    regime: MarketRegime
+    signal_type: str
+    entry_price: float
+    exit_price: Optional[float]
+    position_size_usd: float
+    pnl_usd: Optional[float]  # Actual profit/loss
+    pnl_pct: Optional[float]  # P&L percentage
+    holding_time_hours: Optional[float]
+    exit_reason: str  # "regime_change", "target", "stop", "manual"
+    status: str  # "open", "closed"
 
 # ====================================================================
 # TELEGRAM NOTIFIER
@@ -241,9 +263,10 @@ class TelegramNotifier:
 class StatisticsLogger:
     """Log regime statistics for analysis"""
 
-    def __init__(self, regime_log: str = REGIME_LOG_FILE, signal_log: str = SIGNAL_LOG_FILE):
+    def __init__(self, regime_log: str = REGIME_LOG_FILE, signal_log: str = SIGNAL_LOG_FILE, trade_log: str = TRADE_LOG_FILE):
         self.regime_log = regime_log
         self.signal_log = signal_log
+        self.trade_log = trade_log
         self._initialize_logs()
 
     def _initialize_logs(self):
@@ -263,6 +286,13 @@ class StatisticsLogger:
                 f.write("timestamp,symbol,regime,signal_type,confidence,entry_reason,"
                        "expected_holding_days,notes\n")
             logger.info(f"📝 Signal log created: {self.signal_log}")
+
+        # Trade log
+        if not os.path.exists(self.trade_log):
+            with open(self.trade_log, 'w') as f:
+                f.write("entry_time,exit_time,symbol,regime,signal_type,entry_price,exit_price,"
+                       "position_size_usd,pnl_usd,pnl_pct,holding_time_hours,exit_reason,status\n")
+            logger.info(f"📝 Trade log created: {self.trade_log}")
 
     def log_regime(self, state: RegimeState, duration: float = 0):
         """Log regime state"""
@@ -295,6 +325,32 @@ class StatisticsLogger:
                        f'"{signal.notes}"\n')
         except Exception as e:
             logger.error(f"Error logging signal: {e}")
+
+    def log_trade(self, trade: Trade):
+        """Log actual trade result"""
+        try:
+            with open(self.trade_log, 'a') as f:
+                exit_time_str = trade.exit_time.strftime('%Y-%m-%d %H:%M:%S') if trade.exit_time else ""
+                exit_price_str = f"{trade.exit_price:.2f}" if trade.exit_price else ""
+                pnl_usd_str = f"{trade.pnl_usd:.2f}" if trade.pnl_usd is not None else ""
+                pnl_pct_str = f"{trade.pnl_pct:.4f}" if trade.pnl_pct is not None else ""
+                holding_time_str = f"{trade.holding_time_hours:.2f}" if trade.holding_time_hours is not None else ""
+
+                f.write(f"{trade.entry_time.strftime('%Y-%m-%d %H:%M:%S')},"
+                       f"{exit_time_str},"
+                       f"{trade.symbol},"
+                       f"{trade.regime.value},"
+                       f"{trade.signal_type},"
+                       f"{trade.entry_price:.2f},"
+                       f"{exit_price_str},"
+                       f"{trade.position_size_usd:.2f},"
+                       f"{pnl_usd_str},"
+                       f"{pnl_pct_str},"
+                       f"{holding_time_str},"
+                       f'"{trade.exit_reason}",'
+                       f"{trade.status}\n")
+        except Exception as e:
+            logger.error(f"Error logging trade: {e}")
 
     def get_regime_statistics(self, hours: int = 24) -> Dict:
         """Get regime performance statistics"""
@@ -1001,6 +1057,11 @@ class WebSocketManager:
         self.current_regime: Dict[str, MarketRegime] = {}
         self.regime_start_time: Dict[str, datetime] = {}
 
+        # Position tracking
+        self.open_positions: Dict[str, Trade] = {}  # symbol -> Trade
+        self.start_time = datetime.now()
+        self.warmup_complete = False
+
         self.running = False
         self.analysis_count = 0
 
@@ -1086,6 +1147,23 @@ class WebSocketManager:
 
     async def analyze_regimes(self):
         """Analyze current regime for all symbols"""
+        # Check warmup period
+        elapsed_minutes = (datetime.now() - self.start_time).total_seconds() / 60
+        if not self.warmup_complete:
+            if elapsed_minutes < WARMUP_PERIOD_MINUTES:
+                # Still in warmup - just collect data
+                logger.debug(f"⏳ Warmup: {elapsed_minutes:.1f}/{WARMUP_PERIOD_MINUTES} minutes")
+                return
+            else:
+                # Warmup complete
+                self.warmup_complete = True
+                logger.info(f"✅ Warmup complete! Starting signal generation...")
+                self.telegram.send_message(
+                    f"✅ <b>Warmup Complete</b>\n\n"
+                    f"Collected {WARMUP_PERIOD_MINUTES} minutes of data.\n"
+                    f"Now generating signals..."
+                )
+
         for symbol in self.symbols:
             try:
                 # Detect regime
@@ -1109,19 +1187,120 @@ class WebSocketManager:
                     # Send Telegram notification
                     self.telegram.send_regime_change(old_regime, new_state)
 
+                    # Handle open position (if exists)
+                    if symbol in self.open_positions:
+                        await self.close_position(symbol, "regime_change")
+
                     # Update state
                     self.current_regime[symbol] = new_state.regime
                     self.regime_start_time[symbol] = datetime.now()
 
-                    # Generate signal
-                    signal = self.signal_generator.generate_signal(new_state)
-                    if signal:
-                        logger.info(f"🚨 SIGNAL: {signal.signal_type} {signal.symbol} (Regime: {signal.regime.value})")
-                        self.stats_logger.log_signal(signal)
-                        self.telegram.send_signal(signal)
+                    # Generate signal (only after warmup)
+                    if self.warmup_complete:
+                        signal = self.signal_generator.generate_signal(new_state)
+                        if signal:
+                            logger.info(f"🚨 SIGNAL: {signal.signal_type} {signal.symbol} (Regime: {signal.regime.value})")
+                            self.stats_logger.log_signal(signal)
+                            self.telegram.send_signal(signal)
+
+                            # Open position
+                            await self.open_position(signal, new_state)
 
             except Exception as e:
                 logger.error(f"Error analyzing {symbol}: {e}")
+
+    async def open_position(self, signal: RegimeSignal, state: RegimeState):
+        """Open a tracked position"""
+        try:
+            # Get current price
+            market_data = self.processor.get_market_data(signal.symbol)
+            if not market_data:
+                return
+
+            entry_price = market_data.perp_price
+
+            # Create trade
+            trade = Trade(
+                entry_time=datetime.now(),
+                exit_time=None,
+                symbol=signal.symbol,
+                regime=signal.regime,
+                signal_type=signal.signal_type,
+                entry_price=entry_price,
+                exit_price=None,
+                position_size_usd=POSITION_SIZE_USD,
+                pnl_usd=None,
+                pnl_pct=None,
+                holding_time_hours=None,
+                exit_reason="",
+                status="open"
+            )
+
+            self.open_positions[signal.symbol] = trade
+            self.stats_logger.log_trade(trade)
+
+            logger.info(f"📊 Position opened: {signal.signal_type} {signal.symbol} @ ${entry_price:.2f}")
+
+        except Exception as e:
+            logger.error(f"Error opening position: {e}")
+
+    async def close_position(self, symbol: str, reason: str):
+        """Close an open position"""
+        try:
+            if symbol not in self.open_positions:
+                return
+
+            trade = self.open_positions[symbol]
+
+            # Get current price
+            market_data = self.processor.get_market_data(symbol)
+            if not market_data:
+                return
+
+            exit_price = market_data.perp_price
+
+            # Calculate P&L
+            if trade.signal_type == "LONG":
+                pnl_pct = (exit_price - trade.entry_price) / trade.entry_price
+            elif trade.signal_type == "SHORT":
+                pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
+            else:  # CARRY
+                pnl_pct = 0.0  # Simplified for now
+
+            pnl_usd = trade.position_size_usd * pnl_pct
+
+            # Update trade
+            trade.exit_time = datetime.now()
+            trade.exit_price = exit_price
+            trade.pnl_usd = pnl_usd
+            trade.pnl_pct = pnl_pct
+            trade.holding_time_hours = (trade.exit_time - trade.entry_time).total_seconds() / 3600
+            trade.exit_reason = reason
+            trade.status = "closed"
+
+            # Log trade
+            self.stats_logger.log_trade(trade)
+
+            # Send notification
+            emoji = "🟢" if pnl_usd > 0 else "🔴"
+            self.telegram.send_message(
+                f"{emoji} <b>Position Closed: {symbol}</b>\n\n"
+                f"<b>Regime:</b> {trade.regime.value}\n"
+                f"<b>Type:</b> {trade.signal_type}\n"
+                f"<b>Entry:</b> ${trade.entry_price:.2f}\n"
+                f"<b>Exit:</b> ${exit_price:.2f}\n"
+                f"<b>P&L:</b> ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%)\n"
+                f"<b>Hold Time:</b> {trade.holding_time_hours:.1f}h\n"
+                f"<b>Reason:</b> {reason}"
+            )
+
+            logger.info(f"📊 Position closed: {symbol} | P&L: ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%)")
+
+            # Remove from open positions
+            del self.open_positions[symbol]
+
+        except Exception as e:
+            logger.error(f"Error closing position: {e}")
 
     async def start(self):
         """Start all streams"""

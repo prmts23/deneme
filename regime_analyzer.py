@@ -21,6 +21,7 @@ import sys
 
 REGIME_LOG_FILE = "regime_stats.csv"
 SIGNAL_LOG_FILE = "regime_signals.csv"
+TRADE_LOG_FILE = "regime_trades.csv"
 
 # ====================================================================
 # DATA LOADER
@@ -65,6 +66,28 @@ def load_signal_data(file_path: str, days: int = None) -> pd.DataFrame:
     except Exception as e:
         print(f"❌ Error: {e}")
         sys.exit(1)
+
+def load_trade_data(file_path: str, days: int = None) -> pd.DataFrame:
+    """Load actual trade results"""
+    try:
+        df = pd.read_csv(file_path)
+        df['entry_time'] = pd.to_datetime(df['entry_time'])
+        if 'exit_time' in df.columns:
+            df['exit_time'] = pd.to_datetime(df['exit_time'])
+
+        if days:
+            cutoff = datetime.now() - timedelta(days=days)
+            df = df[df['entry_time'] >= cutoff]
+
+        print(f"✅ Loaded {len(df)} trades")
+        return df
+
+    except FileNotFoundError:
+        print(f"⚠️  Trade log not found (no trades yet)")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"❌ Error loading trades: {e}")
+        return pd.DataFrame()
 
 # ====================================================================
 # ANALYSIS FUNCTIONS
@@ -257,11 +280,107 @@ def analyze_best_regime(regime_df: pd.DataFrame, signal_df: pd.DataFrame):
     print(f"  ✅ Highest confidence regime: {highest_confidence}")
     print(f"     → Average confidence: {scores_df.loc[highest_confidence, 'avg_confidence']:.1%}")
 
+def analyze_trade_pnl(trade_df: pd.DataFrame):
+    """Analyze actual P&L by regime"""
+    print("\n" + "="*80)
+    print("💰 ACTUAL P&L ANALYSIS (MOST IMPORTANT!)")
+    print("="*80)
+
+    if trade_df.empty:
+        print("  ⚠️  No completed trades yet. Keep system running to collect data.")
+        return
+
+    # Filter closed trades
+    closed_trades = trade_df[trade_df['status'] == 'closed']
+
+    if closed_trades.empty:
+        print("  ⚠️  No closed trades yet. All positions are still open.")
+        return
+
+    # Overall statistics
+    total_trades = len(closed_trades)
+    winning_trades = len(closed_trades[closed_trades['pnl_usd'] > 0])
+    losing_trades = len(closed_trades[closed_trades['pnl_usd'] < 0])
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+
+    total_pnl = closed_trades['pnl_usd'].sum()
+    avg_pnl = closed_trades['pnl_usd'].mean()
+    best_trade = closed_trades['pnl_usd'].max()
+    worst_trade = closed_trades['pnl_usd'].min()
+
+    print(f"\n📊 OVERALL STATISTICS:")
+    print(f"  Total Closed Trades: {total_trades}")
+    print(f"  Winners: {winning_trades} ({win_rate:.1f}%)")
+    print(f"  Losers: {losing_trades}")
+    print(f"\n  Total P&L: ${total_pnl:+.2f}")
+    print(f"  Average P&L per Trade: ${avg_pnl:+.2f}")
+    print(f"  Best Trade: ${best_trade:+.2f}")
+    print(f"  Worst Trade: ${worst_trade:+.2f}")
+
+    # P&L by regime
+    print(f"\n📈 P&L BY REGIME:")
+    regime_pnl = closed_trades.groupby('regime').agg({
+        'pnl_usd': ['count', 'sum', 'mean', 'std'],
+        'pnl_pct': 'mean',
+        'holding_time_hours': 'mean'
+    }).round(2)
+
+    regime_pnl.columns = ['Trades', 'Total_PnL', 'Avg_PnL', 'Std_PnL', 'Avg_PnL_Pct', 'Avg_Hold_Hours']
+
+    # Calculate win rate by regime
+    win_rates = {}
+    for regime in closed_trades['regime'].unique():
+        regime_trades = closed_trades[closed_trades['regime'] == regime]
+        winners = len(regime_trades[regime_trades['pnl_usd'] > 0])
+        win_rates[regime] = (winners / len(regime_trades) * 100) if len(regime_trades) > 0 else 0
+
+    regime_pnl['Win_Rate'] = regime_pnl.index.map(win_rates)
+
+    # Sort by total P&L
+    regime_pnl = regime_pnl.sort_values('Total_PnL', ascending=False)
+
+    print(regime_pnl)
+
+    # Best regime
+    if not regime_pnl.empty:
+        best_regime = regime_pnl.index[0]
+        best_pnl = regime_pnl.loc[best_regime, 'Total_PnL']
+        best_wr = regime_pnl.loc[best_regime, 'Win_Rate']
+
+        print(f"\n🏆 BEST PERFORMING REGIME:")
+        print(f"  ✅ {best_regime}")
+        print(f"     → Total P&L: ${best_pnl:+.2f}")
+        print(f"     → Win Rate: {best_wr:.1f}%")
+        print(f"     → Avg P&L: ${regime_pnl.loc[best_regime, 'Avg_PnL']:+.2f}")
+
+    # P&L by signal type
+    print(f"\n📊 P&L BY SIGNAL TYPE:")
+    signal_pnl = closed_trades.groupby('signal_type').agg({
+        'pnl_usd': ['count', 'sum', 'mean'],
+        'pnl_pct': 'mean'
+    }).round(2)
+
+    signal_pnl.columns = ['Trades', 'Total_PnL', 'Avg_PnL', 'Avg_PnL_Pct']
+    signal_pnl = signal_pnl.sort_values('Total_PnL', ascending=False)
+
+    print(signal_pnl)
+
+    # P&L by symbol
+    print(f"\n💰 TOP 10 SYMBOLS BY P&L:")
+    symbol_pnl = closed_trades.groupby('symbol').agg({
+        'pnl_usd': ['count', 'sum', 'mean']
+    }).round(2)
+
+    symbol_pnl.columns = ['Trades', 'Total_PnL', 'Avg_PnL']
+    symbol_pnl = symbol_pnl.sort_values('Total_PnL', ascending=False).head(10)
+
+    print(symbol_pnl)
+
 # ====================================================================
 # MAIN REPORT
 # ====================================================================
 
-def generate_report(regime_df: pd.DataFrame, signal_df: pd.DataFrame):
+def generate_report(regime_df: pd.DataFrame, signal_df: pd.DataFrame, trade_df: pd.DataFrame):
     """Generate comprehensive report"""
 
     print("\n" + "="*80)
@@ -271,9 +390,13 @@ def generate_report(regime_df: pd.DataFrame, signal_df: pd.DataFrame):
     print(f"Data Period: {regime_df['timestamp'].min().date()} to {regime_df['timestamp'].max().date()}")
     print(f"Total Samples: {len(regime_df)}")
     print(f"Total Signals: {len(signal_df)}")
+    print(f"Total Trades: {len(trade_df)}")
     print("="*80)
 
-    # Run analyses
+    # MOST IMPORTANT: P&L analysis first!
+    analyze_trade_pnl(trade_df)
+
+    # Then other analyses
     analyze_regime_distribution(regime_df)
     analyze_regime_metrics(regime_df)
     analyze_signal_performance(signal_df)
@@ -285,9 +408,9 @@ def generate_report(regime_df: pd.DataFrame, signal_df: pd.DataFrame):
     print("📝 NEXT STEPS:")
     print("="*80)
     print("  1. Let system collect data for at least 24-48 hours")
-    print("  2. Focus on regimes with highest signal frequency")
-    print("  3. Adjust thresholds based on regime performance")
-    print("  4. Track actual trade results for each regime")
+    print("  2. Focus on regimes with HIGHEST P&L (not just signal frequency)")
+    print("  3. Disable losing regimes, double down on winning regimes")
+    print("  4. Adjust confidence thresholds based on win rate")
     print("  5. Iterate and optimize")
     print("\n")
 
@@ -305,6 +428,7 @@ def main():
     # Load data
     regime_df = load_regime_data(REGIME_LOG_FILE, args.days)
     signal_df = load_signal_data(SIGNAL_LOG_FILE, args.days)
+    trade_df = load_trade_data(TRADE_LOG_FILE, args.days)
 
     if regime_df.empty:
         print("❌ No regime data found. Run the system first!")
@@ -314,10 +438,12 @@ def main():
     if args.regime:
         regime_df = regime_df[regime_df['regime'] == args.regime]
         signal_df = signal_df[signal_df['regime'] == args.regime]
+        if not trade_df.empty:
+            trade_df = trade_df[trade_df['regime'] == args.regime]
         print(f"\n🔍 Filtering by regime: {args.regime}")
 
     # Generate report
-    generate_report(regime_df, signal_df)
+    generate_report(regime_df, signal_df, trade_df)
 
 if __name__ == "__main__":
     main()
