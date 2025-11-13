@@ -76,19 +76,33 @@ class Harmonic10kxStrategy(IStrategy):
 
             # Pattern detection yap (sadece son window için)
             all_patterns = self.detector.detect_all_patterns(recent_data)
+
+            # ✅ CRITICAL: Pass recent_data to get signals, but they will have correct timestamps
             signals = self.detector.get_all_trading_signals(all_patterns, recent_data)
+
+            logger.info(f"[{metadata.get('pair', '')}] Pattern detection complete: {len(signals)} signals found")
 
             if not signals:
                 return dataframe
 
             # ✅ TÜM sinyalleri kaydet (sadece son 5 değil!)
             # Backtest'te populate_indicators bir kez çalışır, tüm pattern'ları kaydetmeliyiz
+            saved_count = 0
+            skipped_count = 0
+
             for signal in signals:
                 sig_timestamp = signal['timestamp']
 
-                # Timestamp'in dataframe'de olduğundan emin ol
-                if sig_timestamp not in dataframe.index:
-                    logger.warning(f"Signal timestamp {sig_timestamp} not in dataframe index!")
+                # ✅ Timestamp'in dataframe'de olduğundan emin ol
+                try:
+                    # Test if timestamp exists in index
+                    _ = dataframe.loc[sig_timestamp]
+                except KeyError:
+                    logger.warning(
+                        f"Signal timestamp {sig_timestamp} not in dataframe index "
+                        f"(type: {type(sig_timestamp)}, first df index: {dataframe.index[0]})"
+                    )
+                    skipped_count += 1
                     continue
 
                 # Duplicate pattern kontrolü - önceki candle ile aynı mı?
@@ -133,11 +147,19 @@ class Harmonic10kxStrategy(IStrategy):
                 elif signal['signal_type'] == 'SELL':
                     dataframe.at[sig_timestamp, 'has_bearish_pattern'] = True
 
-                logger.info(
-                    f"[{metadata.get('pair', '')}] ✅ Pattern saved @ {sig_timestamp}: "
+                saved_count += 1
+
+                logger.debug(
+                    f"[{metadata.get('pair', '')}] Pattern saved @ {sig_timestamp}: "
                     f"{signal.get('pattern', 'N/A')} ({signal['signal_type']}) "
                     f"Score: {signal['score']:.2f}"
                 )
+
+            # Summary log
+            logger.info(
+                f"[{metadata.get('pair', '')}] Pattern detection summary: "
+                f"{saved_count} patterns saved, {skipped_count} skipped"
+            )
 
         except Exception as e:
             logger.error(f"Pattern detection error: {e}", exc_info=True)
