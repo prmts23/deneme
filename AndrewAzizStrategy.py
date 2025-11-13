@@ -250,15 +250,15 @@ class AndrewAzizStrategy(IStrategy):
         )
 
         # === COMBINE SIGNALS (any of the 3 strategies) ===
-        dataframe.loc[
-            (orb_long | vwap_long | ema_long),
-            'enter_long'
-        ] = 1
+        # Set entry signals and tags (Freqtrade uses 'enter_tag' not 'entry_strategy')
+        dataframe.loc[orb_long, 'enter_long'] = 1
+        dataframe.loc[orb_long, 'enter_tag'] = 'ORB'
 
-        # Store strategy type for custom stoploss
-        dataframe.loc[orb_long, 'entry_strategy'] = 'ORB'
-        dataframe.loc[vwap_long, 'entry_strategy'] = 'VWAP'
-        dataframe.loc[ema_long, 'entry_strategy'] = 'EMA'
+        dataframe.loc[vwap_long, 'enter_long'] = 1
+        dataframe.loc[vwap_long, 'enter_tag'] = 'VWAP'
+
+        dataframe.loc[ema_long, 'enter_long'] = 1
+        dataframe.loc[ema_long, 'enter_tag'] = 'EMA'
 
         return dataframe
 
@@ -269,35 +269,33 @@ class AndrewAzizStrategy(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         Exit signals (Andrew Aziz: cut losses, let winners run)
+
+        IMPORTANT: Keep exit signals MINIMAL
+        - Let ROI and trailing stop do the work
+        - Only exit on STRONG reversal signals
         """
 
-        conditions_exit = []
-
-        # === EXIT 1: Trend reversal ===
-        exit_trend_reversal = (
-            # EMA cross down
+        # === EXIT: Strong trend reversal ONLY ===
+        # Must have ALL conditions (very strict)
+        exit_strong_reversal = (
+            # Strong EMA cross down
             (dataframe['ema_9'] < dataframe['ema_20']) &
 
-            # Below VWAP
-            (dataframe['close'] < dataframe['vwap']) &
+            # Well below VWAP (not just touched)
+            (dataframe['close'] < dataframe['vwap'] * 0.995) &  # -0.5%
 
-            # Volume confirmation
-            (dataframe['volume'] > dataframe['volume_sma'])
+            # Price below both EMAs
+            (dataframe['close'] < dataframe['ema_9']) &
+            (dataframe['close'] < dataframe['ema_20']) &
+
+            # High volume reversal
+            (dataframe['volume'] > dataframe['volume_sma'] * 1.5) &
+
+            # RSI confirms weakness
+            (dataframe['rsi'] < 40)
         )
 
-        # === EXIT 2: Overbought ===
-        exit_overbought = (
-            (dataframe['rsi'] > 75) &
-            (dataframe['close'] < dataframe['ema_9'])
-        )
-
-        # === EXIT 3: Time-based (end of day - Andrew Aziz: no overnight holds) ===
-        # Note: In Freqtrade, implement this in custom_exit()
-
-        dataframe.loc[
-            (exit_trend_reversal | exit_overbought),
-            'exit_long'
-        ] = 1
+        dataframe.loc[exit_strong_reversal, 'exit_long'] = 1
 
         return dataframe
 
@@ -318,43 +316,28 @@ class AndrewAzizStrategy(IStrategy):
         """
         Custom stop loss based on Andrew Aziz methodology
 
-        - ORB: SL at opening range low
-        - VWAP: SL 0.5% below VWAP
-        - EMA: SL at 20 EMA or 1% below
+        SIMPLIFIED: Use FIXED stop loss based on entry price, not dynamic indicators
+        - This prevents stop loss from moving unfavorably
+        - Andrew Aziz: Set SL at entry and DON'T move it (except trailing)
+
+        Strategy-based stops:
+        - ORB: -1.5% (wider for breakouts)
+        - VWAP: -1.0% (standard)
+        - EMA: -0.8% (tighter for bounces)
         """
 
-        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-        last_candle = dataframe.iloc[-1].squeeze()
+        # Get entry strategy
+        entry_strategy = trade.enter_tag or 'VWAP'
 
-        # Get entry strategy from trade metadata
-        entry_strategy = trade.enter_tag or 'VWAP'  # Default
-
+        # FIXED stop loss percentages (don't change after entry)
         if entry_strategy == 'ORB':
-            # ORB Stop: Opening Range Low
-            or_low = last_candle.get('or_low', 0)
-            if or_low > 0:
-                sl_price = or_low
-                sl_pct = (trade.open_rate - sl_price) / trade.open_rate
-                return -sl_pct if sl_pct > 0 else -0.01
-
+            return -0.015  # -1.5% (breakouts need room)
         elif entry_strategy == 'VWAP':
-            # VWAP Stop: 0.5% below VWAP
-            vwap = last_candle.get('vwap', 0)
-            if vwap > 0:
-                sl_price = vwap * 0.995  # -0.5%
-                sl_pct = (trade.open_rate - sl_price) / trade.open_rate
-                return -sl_pct if sl_pct > 0 else -0.01
-
+            return -0.01   # -1.0% (standard)
         elif entry_strategy == 'EMA':
-            # EMA Stop: 20 EMA or 1%
-            ema_20 = last_candle.get('ema_20', 0)
-            if ema_20 > 0:
-                sl_price = ema_20
-                sl_pct = (trade.open_rate - sl_price) / trade.open_rate
-                return -min(sl_pct, 0.01) if sl_pct > 0 else -0.01
-
-        # Default: 1% stop
-        return -0.01
+            return -0.008  # -0.8% (tight for bounces)
+        else:
+            return -0.01   # -1.0% default
 
     # ====================================================================
     # CUSTOM EXIT (Andrew Aziz: time-based, end of day)
@@ -458,7 +441,7 @@ class AndrewAzizStrategy(IStrategy):
         Andrew Aziz's #1 indicator
 
         VWAP = Cumulative(Price × Volume) / Cumulative(Volume)
-        Reset daily
+        Reset daily at 00:00 UTC
         """
         # Typical price
         typical_price = (dataframe['high'] + dataframe['low'] + dataframe['close']) / 3
@@ -466,34 +449,63 @@ class AndrewAzizStrategy(IStrategy):
         # Price × Volume
         pv = typical_price * dataframe['volume']
 
-        # Cumulative sum (reset daily - not implemented here, use groupby if needed)
-        cumulative_pv = pv.cumsum()
-        cumulative_volume = dataframe['volume'].cumsum()
+        # Daily reset (group by date)
+        df_copy = dataframe.copy()
+        df_copy['pv'] = pv
+        df_copy['date'] = pd.to_datetime(df_copy['date']).dt.date
 
-        # VWAP
-        vwap = cumulative_pv / cumulative_volume
+        # Cumulative sum per day
+        df_copy['cumulative_pv'] = df_copy.groupby('date')['pv'].transform(pd.Series.cumsum)
+        df_copy['cumulative_volume'] = df_copy.groupby('date')['volume'].transform(pd.Series.cumsum)
+
+        # VWAP per day
+        vwap = df_copy['cumulative_pv'] / df_copy['cumulative_volume']
 
         return vwap.fillna(dataframe['close'])
 
     def calculate_opening_range(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
-        Calculate Opening Range (first N minutes)
+        Calculate Opening Range (first N minutes of each day)
 
         Andrew Aziz: Opening Range Breakout strategy
-        - Track high/low of first 15 minutes
+        - Track high/low of first 15 minutes of THE DAY
         - Breakout = strong signal
+        - Opening Range is FIXED for entire day (not rolling!)
         """
 
-        # Note: For proper OR, need to track daily reset
-        # Simplified version here (track rolling window)
+        # Get date column
+        df_copy = dataframe.copy()
+        df_copy['date'] = pd.to_datetime(df_copy['date']).dt.date
 
+        # Number of candles in opening range (N minutes on 1m timeframe = N candles)
         or_window = self.opening_range_minutes.value
 
-        dataframe['or_high'] = dataframe['high'].rolling(window=or_window).max()
-        dataframe['or_low'] = dataframe['low'].rolling(window=or_window).min()
+        # For each day, get first N candles' high/low
+        def get_daily_or(group):
+            """Get Opening Range high/low for the day"""
+            if len(group) < or_window:
+                # Not enough candles yet
+                return pd.Series({
+                    'or_high': group['high'].max(),
+                    'or_low': group['low'].min()
+                })
+            else:
+                # First N candles of the day
+                first_candles = group.head(or_window)
+                return pd.Series({
+                    'or_high': first_candles['high'].max(),
+                    'or_low': first_candles['low'].min()
+                })
 
-        # For production: implement daily reset logic
-        # Group by date, take first N candles, get max/min
+        # Calculate OR per day and forward-fill for entire day
+        daily_or = df_copy.groupby('date').apply(get_daily_or).reset_index()
+
+        # Merge back to dataframe
+        df_copy = df_copy.merge(daily_or, on='date', how='left')
+
+        # Assign to original dataframe
+        dataframe['or_high'] = df_copy['or_high'].fillna(0)
+        dataframe['or_low'] = df_copy['or_low'].fillna(0)
 
         return dataframe
 
