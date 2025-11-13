@@ -73,6 +73,15 @@ TRADE_LOG_FILE = "regime_trades.csv"  # Actual P&L results
 # System Behavior
 WARMUP_PERIOD_MINUTES = 15  # Collect data before generating signals
 POSITION_SIZE_USD = 1000  # Position size for P&L calculation
+MIN_HOLDING_TIME_HOURS = 1.0  # Minimum 1 hour hold time (prevent overtrading)
+
+# Fee and Slippage (Binance)
+SPOT_FEE = 0.001  # 0.1% spot taker
+PERP_FEE = 0.0004  # 0.04% futures taker
+SLIPPAGE = 0.0005  # 0.05% slippage per execution
+TOTAL_ENTRY_FEE_PCT = SPOT_FEE + PERP_FEE + (SLIPPAGE * 2)  # 0.24%
+TOTAL_EXIT_FEE_PCT = SPOT_FEE + PERP_FEE + (SLIPPAGE * 2)  # 0.24%
+TOTAL_ROUND_TRIP_FEE_PCT = TOTAL_ENTRY_FEE_PCT + TOTAL_EXIT_FEE_PCT  # 0.48%
 
 # Logging
 logging.basicConfig(
@@ -1252,6 +1261,12 @@ class WebSocketManager:
 
             trade = self.open_positions[symbol]
 
+            # Check minimum holding time (prevent overtrading)
+            holding_time_hours = (datetime.now() - trade.entry_time).total_seconds() / 3600
+            if holding_time_hours < MIN_HOLDING_TIME_HOURS and reason == "regime_change":
+                logger.info(f"⏳ Skipping close: {symbol} held for {holding_time_hours:.2f}h < {MIN_HOLDING_TIME_HOURS}h minimum")
+                return
+
             # Get current price
             market_data = self.processor.get_market_data(symbol)
             if not market_data:
@@ -1259,21 +1274,23 @@ class WebSocketManager:
 
             exit_price = market_data.perp_price
 
-            # Calculate P&L
+            # Calculate gross P&L (before fees)
             if trade.signal_type == "LONG":
-                pnl_pct = (exit_price - trade.entry_price) / trade.entry_price
+                gross_pnl_pct = (exit_price - trade.entry_price) / trade.entry_price
             elif trade.signal_type == "SHORT":
-                pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
+                gross_pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
             else:  # CARRY
-                pnl_pct = 0.0  # Simplified for now
+                gross_pnl_pct = 0.0  # Simplified for now
 
-            pnl_usd = trade.position_size_usd * pnl_pct
+            # Subtract fees and slippage (0.48% round trip)
+            net_pnl_pct = gross_pnl_pct - TOTAL_ROUND_TRIP_FEE_PCT
+            pnl_usd = trade.position_size_usd * net_pnl_pct
 
             # Update trade
             trade.exit_time = datetime.now()
             trade.exit_price = exit_price
             trade.pnl_usd = pnl_usd
-            trade.pnl_pct = pnl_pct
+            trade.pnl_pct = net_pnl_pct
             trade.holding_time_hours = (trade.exit_time - trade.entry_time).total_seconds() / 3600
             trade.exit_reason = reason
             trade.status = "closed"
@@ -1289,12 +1306,13 @@ class WebSocketManager:
                 f"<b>Type:</b> {trade.signal_type}\n"
                 f"<b>Entry:</b> ${trade.entry_price:.2f}\n"
                 f"<b>Exit:</b> ${exit_price:.2f}\n"
-                f"<b>P&L:</b> ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%)\n"
+                f"<b>P&L (net):</b> ${pnl_usd:+.2f} ({net_pnl_pct*100:+.2f}%)\n"
+                f"<b>Fees:</b> {TOTAL_ROUND_TRIP_FEE_PCT*100:.2f}%\n"
                 f"<b>Hold Time:</b> {trade.holding_time_hours:.1f}h\n"
                 f"<b>Reason:</b> {reason}"
             )
 
-            logger.info(f"📊 Position closed: {symbol} | P&L: ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%)")
+            logger.info(f"📊 Position closed: {symbol} | P&L: ${pnl_usd:+.2f} ({net_pnl_pct*100:+.2f}%)")
 
             # Remove from open positions
             del self.open_positions[symbol]
