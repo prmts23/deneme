@@ -29,6 +29,7 @@ class Harmonic10kxStrategy(IStrategy):
 
     # ✅ Pattern detection için sliding window (performans için)
     pattern_lookback_window = 200  # Sadece son 200 candle'a bak
+    live_pattern_candle_count = 3  # Live/Dry modda son kaç candle'ı işle
 
     def __init__(self, config: dict) -> None:
         super().__init__(config)
@@ -70,6 +71,9 @@ class Harmonic10kxStrategy(IStrategy):
             return dataframe
 
         try:
+            # ✅ Detect if we're in backtest or live/dry mode
+            is_backtest = self.dp.runmode.value == 'backtest'
+
             # ✅ Sliding window approach - sadece son N candle'a bak
             lookback = min(self.pattern_lookback_window, len(dataframe))
             recent_data = dataframe.tail(lookback).copy()
@@ -80,17 +84,36 @@ class Harmonic10kxStrategy(IStrategy):
             # ✅ CRITICAL: Pass recent_data to get signals, but they will have correct timestamps
             signals = self.detector.get_all_trading_signals(all_patterns, recent_data)
 
-            logger.info(f"[{metadata.get('pair', '')}] Pattern detection complete: {len(signals)} signals found")
+            logger.info(
+                f"[{metadata.get('pair', '')}] Pattern detection complete: "
+                f"{len(signals)} signals found (mode: {self.dp.runmode.value})"
+            )
 
             if not signals:
                 return dataframe
 
-            # ✅ TÜM sinyalleri kaydet (sadece son 5 değil!)
-            # Backtest'te populate_indicators bir kez çalışır, tüm pattern'ları kaydetmeliyiz
+            # ✅ Filter signals based on mode
+            if is_backtest:
+                # BACKTEST: Tüm pattern'ları kaydet (populate_indicators bir kez çalışır)
+                filtered_signals = signals
+                logger.debug(f"Backtest mode: processing all {len(signals)} signals")
+            else:
+                # LIVE/DRY: Sadece son birkaç candle'daki pattern'ları kaydet
+                # Her candle'da yeniden çalışacağı için eski pattern'ları tekrar kaydetmeye gerek yok
+                recent_timestamps = dataframe.index[-self.live_pattern_candle_count:]
+                filtered_signals = [s for s in signals if s['timestamp'] in recent_timestamps]
+                logger.debug(
+                    f"Live/Dry mode: filtered {len(signals)} -> {len(filtered_signals)} "
+                    f"(last {self.live_pattern_candle_count} candles only)"
+                )
+
+            if not filtered_signals:
+                return dataframe
+
             saved_count = 0
             skipped_count = 0
 
-            for signal in signals:
+            for signal in filtered_signals:
                 sig_timestamp = signal['timestamp']
 
                 # ✅ Timestamp'in dataframe'de olduğundan emin ol
