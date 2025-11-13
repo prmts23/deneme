@@ -67,8 +67,12 @@ ROLLING_WINDOW_15M = 15  # 15 minutes
 
 # Signal Thresholds
 FUNDING_Z_THRESHOLD = 2.0  # Z-score threshold for funding spike
-CVD_CHANGE_THRESHOLD = 10000  # Threshold for significant CVD change
+# CVD_CHANGE_THRESHOLD removed - using CVD for direction only, not threshold
 BASIS_THRESHOLD = 0.001  # 0.1% basis threshold
+
+# Data Collection
+ENABLE_SIGNAL_LOGGING = True  # Log all signals to CSV for analysis
+SIGNAL_LOG_FILE = "signals_log.csv"  # Signal log file
 
 # Logging
 logging.basicConfig(
@@ -314,6 +318,105 @@ class TelegramNotifier:
         message += f"\n<b>Now monitoring:</b> {', '.join(new_symbols)}"
 
         return self.send_message(message)
+
+# ====================================================================
+# SIGNAL LOGGER (CSV Export for Analysis)
+# ====================================================================
+
+class SignalLogger:
+    """Log all signals to CSV for later analysis"""
+
+    def __init__(self, log_file: str = SIGNAL_LOG_FILE):
+        self.log_file = log_file
+        self.enabled = ENABLE_SIGNAL_LOGGING
+
+        # Create CSV with headers if it doesn't exist
+        if self.enabled:
+            self._initialize_csv()
+
+    def _initialize_csv(self):
+        """Create CSV file with headers if it doesn't exist"""
+        import os
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w') as f:
+                f.write("timestamp,symbol,signal_type,confidence,funding_rate,funding_z,"
+                       "cvd_change_15m,cvd_direction,basis,mark_price,spot_price,"
+                       "expected_daily_profit,fees_total,payback_days,notes\n")
+            logger.info(f"📝 Signal log file created: {self.log_file}")
+
+    def log_signal(self, signal: Signal, spot_price: float, cvd_direction: str, notes: str = ""):
+        """
+        Log a signal to CSV
+
+        Args:
+            signal: Signal object
+            spot_price: Spot price at signal time
+            cvd_direction: "BULLISH" or "BEARISH" or "NEUTRAL"
+            notes: Optional notes about the signal
+        """
+        if not self.enabled:
+            return
+
+        try:
+            with open(self.log_file, 'a') as f:
+                line = (
+                    f"{signal.timestamp.strftime('%Y-%m-%d %H:%M:%S')},"
+                    f"{signal.symbol},"
+                    f"{signal.signal_type},"
+                    f"{signal.confidence:.4f},"
+                    f"{signal.funding_rate:.6f},"
+                    f"{signal.cvd_change:.0f},"  # This is funding_z in Signal object
+                    f"{signal.cvd_change:.0f},"  # Actual CVD change
+                    f"{cvd_direction},"
+                    f"{signal.basis:.6f},"
+                    f"{signal.expected_profit_daily / signal.confidence if signal.confidence > 0 else 0:.2f},"  # mark_price placeholder
+                    f"{spot_price:.2f},"
+                    f"{signal.expected_profit_daily:.2f},"
+                    f"{signal.fees_total:.2f},"
+                    f"{signal.payback_days:.2f},"
+                    f"\"{notes}\"\n"
+                )
+                f.write(line)
+        except Exception as e:
+            logger.error(f"Error logging signal: {e}")
+
+    def log_signal_detailed(self, **kwargs):
+        """
+        Log signal with custom fields
+
+        Usage:
+            logger.log_signal_detailed(
+                timestamp=datetime.now(),
+                symbol="BTCUSDT",
+                signal_type="SHORT",
+                ...
+            )
+        """
+        if not self.enabled:
+            return
+
+        try:
+            with open(self.log_file, 'a') as f:
+                line = (
+                    f"{kwargs.get('timestamp', datetime.now()).strftime('%Y-%m-%d %H:%M:%S')},"
+                    f"{kwargs.get('symbol', '')},"
+                    f"{kwargs.get('signal_type', '')},"
+                    f"{kwargs.get('confidence', 0):.4f},"
+                    f"{kwargs.get('funding_rate', 0):.6f},"
+                    f"{kwargs.get('funding_z', 0):.2f},"
+                    f"{kwargs.get('cvd_change_15m', 0):.0f},"
+                    f"{kwargs.get('cvd_direction', '')},"
+                    f"{kwargs.get('basis', 0):.6f},"
+                    f"{kwargs.get('mark_price', 0):.2f},"
+                    f"{kwargs.get('spot_price', 0):.2f},"
+                    f"{kwargs.get('expected_daily_profit', 0):.2f},"
+                    f"{kwargs.get('fees_total', 0):.2f},"
+                    f"{kwargs.get('payback_days', 0):.2f},"
+                    f"\"{kwargs.get('notes', '')}\"\n"
+                )
+                f.write(line)
+        except Exception as e:
+            logger.error(f"Error logging detailed signal: {e}")
 
 # ====================================================================
 # FEE AND SLIPPAGE CALCULATOR
@@ -590,14 +693,21 @@ class SignalGenerator:
     """Generate trading signals from features"""
 
     @staticmethod
-    def generate_signal(df: pd.DataFrame, symbol: str, spot_price: float) -> Optional[Signal]:
+    def generate_signal(df: pd.DataFrame, symbol: str, spot_price: float) -> Optional[Tuple[Signal, str]]:
         """
         Generate signal based on current market conditions
 
-        Signal Logic:
-        1. HIGH FUNDING + POSITIVE CVD → SHORT (funding arbitrage)
-        2. LOW FUNDING + NEGATIVE CVD → LONG (contrarian)
-        3. EXTREME FUNDING SPIKE → Mean reversion opportunity
+        SIMPLIFIED Signal Logic (Data-Driven Approach):
+        1. HIGH FUNDING (z > 2.0) + Positive CVD → SHORT (contrarian to bullish pressure)
+        2. LOW FUNDING (z < -2.0) + Negative CVD → LONG (contrarian to bearish pressure)
+        3. EXTREME FUNDING SPIKE (|z| > 3.0) → Mean reversion (ignore CVD)
+
+        CVD is used for DIRECTION only (no threshold):
+        - CVD > 0 = Bullish pressure (buyers aggressive)
+        - CVD < 0 = Bearish pressure (sellers aggressive)
+
+        Returns:
+            Tuple[Signal, cvd_direction] or None
         """
         if df.empty or len(df) < ROLLING_WINDOW_15M:
             return None
@@ -618,30 +728,37 @@ class SignalGenerator:
         round_trip_fees, _ = FeeCalculator.calculate_round_trip_fees(POSITION_SIZE_USD)
         payback_days = FeeCalculator.calculate_payback_period(funding_rate, POSITION_SIZE_USD)
 
+        # CVD Direction (no threshold, just direction)
+        cvd_direction = "BULLISH" if cvd_change_15m > 0 else "BEARISH" if cvd_change_15m < 0 else "NEUTRAL"
+
         # Signal conditions
         signal_type = None
         confidence = 0.0
+        signal_reason = ""
 
-        # Condition 1: High funding + positive basis → SHORT
+        # Condition 1: High funding + bullish CVD → SHORT (contrarian)
         if funding_z > FUNDING_Z_THRESHOLD and funding_rate > 0.0005:  # >0.05% per 8h
-            if cvd_change_15m > CVD_CHANGE_THRESHOLD:  # Aggressive longs
+            if cvd_change_15m > 0:  # Bullish pressure (no threshold)
                 signal_type = "SHORT"
-                confidence = min(abs(funding_z) / 5.0, 1.0)  # Scale confidence
+                confidence = min(abs(funding_z) / 5.0, 1.0)
+                signal_reason = "HIGH_FUNDING_BULLISH_CVD"
 
-        # Condition 2: Negative funding + negative CVD → LONG
+        # Condition 2: Negative funding + bearish CVD → LONG (contrarian)
         elif funding_z < -FUNDING_Z_THRESHOLD and funding_rate < -0.0005:
-            if cvd_change_15m < -CVD_CHANGE_THRESHOLD:  # Aggressive shorts
+            if cvd_change_15m < 0:  # Bearish pressure (no threshold)
                 signal_type = "LONG"
                 confidence = min(abs(funding_z) / 5.0, 1.0)
+                signal_reason = "LOW_FUNDING_BEARISH_CVD"
 
-        # Condition 3: Extreme funding spike (mean reversion)
+        # Condition 3: Extreme funding spike (mean reversion, ignore CVD)
         elif abs(funding_z) > FUNDING_Z_THRESHOLD * 1.5:
             signal_type = "SHORT" if funding_rate > 0 else "LONG"
             confidence = min(abs(funding_z) / 7.0, 1.0)
+            signal_reason = "EXTREME_FUNDING_SPIKE"
 
         # Only generate signal if profitable
         if signal_type and payback_days < 7:  # Must break even within 1 week
-            return Signal(
+            signal = Signal(
                 timestamp=datetime.now(),
                 symbol=symbol,
                 signal_type=signal_type,
@@ -653,6 +770,7 @@ class SignalGenerator:
                 fees_total=round_trip_fees,
                 payback_days=payback_days
             )
+            return (signal, cvd_direction, signal_reason)
 
         return None
 
@@ -667,6 +785,7 @@ class WebSocketManager:
         self.symbols = []  # Will be populated dynamically
         self.processor = DataProcessor()
         self.telegram = telegram_notifier
+        self.signal_logger = SignalLogger()  # CSV logger for analysis
         self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
         self.scanner = SymbolScanner(self.client)
         self.running = False
@@ -781,17 +900,40 @@ class WebSocketManager:
                 # Get spot price (for basis calculation)
                 spot_price = self.get_spot_price(symbol)
 
-                # Generate signal
-                signal = SignalGenerator.generate_signal(df_1m, symbol, spot_price)
+                # Generate signal (returns tuple or None)
+                signal_result = SignalGenerator.generate_signal(df_1m, symbol, spot_price)
 
-                if signal:
+                if signal_result:
+                    signal, cvd_direction, signal_reason = signal_result
+
                     logger.info(f"🚨 SIGNAL: {signal.signal_type} {signal.symbol} | "
                                f"Confidence: {signal.confidence:.1%} | "
                                f"Funding: {signal.funding_rate*100:.4f}% | "
+                               f"CVD: {cvd_direction} | "
+                               f"Reason: {signal_reason} | "
                                f"Payback: {signal.payback_days:.1f} days")
 
                     # Send Telegram notification
                     self.telegram.send_signal(signal)
+
+                    # Log to CSV for analysis
+                    self.signal_logger.log_signal_detailed(
+                        timestamp=signal.timestamp,
+                        symbol=signal.symbol,
+                        signal_type=signal.signal_type,
+                        confidence=signal.confidence,
+                        funding_rate=signal.funding_rate,
+                        funding_z=df_1m.iloc[-1].get("funding_z", 0),
+                        cvd_change_15m=signal.cvd_change,
+                        cvd_direction=cvd_direction,
+                        basis=signal.basis,
+                        mark_price=df_1m.iloc[-1].get("mark_price", 0),
+                        spot_price=spot_price,
+                        expected_daily_profit=signal.expected_profit_daily,
+                        fees_total=signal.fees_total,
+                        payback_days=signal.payback_days,
+                        notes=signal_reason
+                    )
 
                 # Print dashboard
                 self.print_dashboard(df_1m, symbol)
