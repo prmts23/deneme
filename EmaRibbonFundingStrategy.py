@@ -134,19 +134,19 @@ class EmaRibbonFundingStrategy(IStrategy):
     @informative('15m')
     def populate_indicators_15m(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """15-minute timeframe for trend confirmation"""
-        dataframe['ema_21_15m'] = ta.EMA(dataframe, timeperiod=21)
-        dataframe['ema_50_15m'] = ta.EMA(dataframe, timeperiod=50)
-        dataframe['ema_200_15m'] = ta.EMA(dataframe, timeperiod=200)
+        dataframe['ema_21'] = ta.EMA(dataframe, timeperiod=21)
+        dataframe['ema_50'] = ta.EMA(dataframe, timeperiod=50)
+        dataframe['ema_200'] = ta.EMA(dataframe, timeperiod=200)
 
-        # HTF trend
-        dataframe['uptrend_15m'] = (
-            (dataframe['ema_21_15m'] > dataframe['ema_50_15m']) &
-            (dataframe['ema_50_15m'] > dataframe['ema_200_15m'])
+        # HTF trend (will become uptrend_15m in main dataframe)
+        dataframe['uptrend'] = (
+            (dataframe['ema_21'] > dataframe['ema_50']) &
+            (dataframe['ema_50'] > dataframe['ema_200'])
         )
 
-        dataframe['downtrend_15m'] = (
-            (dataframe['ema_21_15m'] < dataframe['ema_50_15m']) &
-            (dataframe['ema_50_15m'] < dataframe['ema_200_15m'])
+        dataframe['downtrend'] = (
+            (dataframe['ema_21'] < dataframe['ema_50']) &
+            (dataframe['ema_50'] < dataframe['ema_200'])
         )
 
         return dataframe

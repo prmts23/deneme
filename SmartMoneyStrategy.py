@@ -126,12 +126,13 @@ class SmartMoneyStrategy(IStrategy):
     @informative('15m')
     def populate_indicators_15m(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """15-minute timeframe for market structure"""
-        dataframe['ema_21_15m'] = ta.EMA(dataframe, timeperiod=21)
-        dataframe['ema_50_15m'] = ta.EMA(dataframe, timeperiod=50)
+        # Note: Freqtrade will add _15m suffix automatically
+        dataframe['ema_21'] = ta.EMA(dataframe, timeperiod=21)
+        dataframe['ema_50'] = ta.EMA(dataframe, timeperiod=50)
 
         # Market structure (higher timeframe)
-        dataframe['swing_high_15m'] = dataframe['high'].rolling(window=10).max()
-        dataframe['swing_low_15m'] = dataframe['low'].rolling(window=10).min()
+        dataframe['swing_high'] = dataframe['high'].rolling(window=10).max()
+        dataframe['swing_low'] = dataframe['low'].rolling(window=10).min()
 
         return dataframe
 
