@@ -81,50 +81,48 @@ class Harmonic10kxStrategy(IStrategy):
             if not signals:
                 return dataframe
 
-            # Son 5 candle için sinyalleri kontrol et (yakın zamanda oluşan pattern'ler)
-            last_idx = dataframe.index[-1]
-            recent_indices = dataframe.index[-5:]
-
+            # ✅ TÜM sinyalleri kaydet (sadece son 5 değil!)
+            # Backtest'te populate_indicators bir kez çalışır, tüm pattern'ları kaydetmeliyiz
             for signal in signals:
                 sig_timestamp = signal['timestamp']
 
-                # Sadece recent candle'lardaki sinyalleri işle
-                if sig_timestamp not in recent_indices:
+                # Timestamp'in dataframe'de olduğundan emin ol
+                if sig_timestamp not in dataframe.index:
+                    logger.warning(f"Signal timestamp {sig_timestamp} not in dataframe index!")
                     continue
 
-                # Duplicate pattern kontrolü
-                if sig_timestamp != last_idx:
-                    # Önceki candle'ları kontrol et
-                    try:
-                        sig_loc = dataframe.index.get_loc(sig_timestamp)
-                        if sig_loc > 0:
-                            prev_idx = dataframe.index[sig_loc - 1]
-                            prev_pattern = dataframe.at[prev_idx, 'pattern_name']
-                            prev_type = dataframe.at[prev_idx, 'pattern_type']
-                            prev_price = dataframe.at[prev_idx, 'pattern_price']
+                # Duplicate pattern kontrolü - önceki candle ile aynı mı?
+                try:
+                    sig_loc = dataframe.index.get_loc(sig_timestamp)
+                    if sig_loc > 0:
+                        prev_idx = dataframe.index[sig_loc - 1]
+                        prev_pattern = dataframe.at[prev_idx, 'pattern_name']
+                        prev_type = dataframe.at[prev_idx, 'pattern_type']
+                        prev_price = dataframe.at[prev_idx, 'pattern_price']
 
-                            curr_pattern = signal.get('pattern', '')
-                            curr_type = signal['signal_type']
-                            curr_price = signal.get('price', np.nan)
+                        curr_pattern = signal.get('pattern', '')
+                        curr_type = signal['signal_type']
+                        curr_price = signal.get('price', np.nan)
 
-                            # Aynı pattern ve fiyat çok yakınsa skip et
-                            if (prev_pattern == curr_pattern and
-                                prev_type == curr_type and
-                                not np.isnan(prev_price) and
-                                not np.isnan(curr_price)):
+                        # Aynı pattern ve fiyat çok yakınsa skip et
+                        if (prev_pattern == curr_pattern and
+                            prev_type == curr_type and
+                            not np.isnan(prev_price) and
+                            not np.isnan(curr_price)):
 
-                                price_diff = abs(curr_price - prev_price) / curr_price
-                                if price_diff < 0.001:  # %0.1'den az fark
-                                    continue
-                    except Exception:
-                        pass
+                            price_diff = abs(curr_price - prev_price) / curr_price
+                            if price_diff < 0.001:  # %0.1'den az fark
+                                logger.debug(f"Skipping duplicate pattern @ {sig_timestamp}")
+                                continue
+                except Exception as e:
+                    logger.debug(f"Duplicate check error: {e}")
 
                 # Eğer bu timestamp'te daha yüksek skorlu pattern varsa, onu kullan
                 current_score = dataframe.at[sig_timestamp, 'pattern_score']
                 if current_score > 0 and signal['score'] <= current_score:
                     continue
 
-                # Pattern bilgilerini DataFrame'e yaz
+                # ✅ Pattern bilgilerini DataFrame'e yaz
                 dataframe.at[sig_timestamp, 'pattern_name'] = signal.get('pattern', '')
                 dataframe.at[sig_timestamp, 'pattern_score'] = signal['score']
                 dataframe.at[sig_timestamp, 'pattern_type'] = signal['signal_type']
@@ -135,8 +133,8 @@ class Harmonic10kxStrategy(IStrategy):
                 elif signal['signal_type'] == 'SELL':
                     dataframe.at[sig_timestamp, 'has_bearish_pattern'] = True
 
-                logger.debug(
-                    f"[{metadata.get('pair', '')}] Pattern detected @ {sig_timestamp}: "
+                logger.info(
+                    f"[{metadata.get('pair', '')}] ✅ Pattern saved @ {sig_timestamp}: "
                     f"{signal.get('pattern', 'N/A')} ({signal['signal_type']}) "
                     f"Score: {signal['score']:.2f}"
                 )
