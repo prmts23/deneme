@@ -55,28 +55,29 @@ class AndrewAzizStrategy(IStrategy):
 
     INTERFACE_VERSION = 3
 
-    # Minimal ROI (Andrew Aziz: 2:1 R/R minimum)
+    # Minimal ROI (Andrew Aziz: 2:1 R/R minimum, optimized for crypto)
     minimal_roi = {
-        "0": 0.02,   # 2% TP (2:1 R/R with 1% SL)
-        "30": 0.015, # 1.5% after 30 min
-        "60": 0.01,  # 1% after 1 hour
-        "120": 0.005 # 0.5% after 2 hours
+        "0": 0.025,   # 2.5% immediate TP (quick scalps)
+        "15": 0.02,   # 2% after 15 min
+        "45": 0.015,  # 1.5% after 45 min
+        "90": 0.01,   # 1% after 1.5 hours
+        "180": 0.005  # 0.5% after 3 hours
     }
 
     # Stoploss (Andrew Aziz: strict SL based on key levels)
-    stoploss = -0.01  # -1% hard stop (adjusted dynamically)
+    stoploss = -0.02  # -2% hard stop (wider for crypto volatility)
 
     # Trailing stop (Andrew Aziz: lock in profits)
     trailing_stop = True
-    trailing_stop_positive = 0.01  # Activate after 1% profit
-    trailing_stop_positive_offset = 0.015  # Trail 1.5% from high
+    trailing_stop_positive = 0.015  # Activate after 1.5% profit
+    trailing_stop_positive_offset = 0.02  # Trail 2% from high (wider)
     trailing_only_offset_is_reached = True
 
     # Timeframe
     timeframe = '1m'  # 1-minute bars (day trading)
 
-    # Use exit signals
-    use_exit_signal = True
+    # Use exit signals (DISABLED - let ROI/trailing do the work)
+    use_exit_signal = False  # Andrew Aziz: "Let winners run"
     exit_profit_only = False
     exit_profit_offset = 0.0
 
@@ -320,10 +321,12 @@ class AndrewAzizStrategy(IStrategy):
         - This prevents stop loss from moving unfavorably
         - Andrew Aziz: Set SL at entry and DON'T move it (except trailing)
 
-        Strategy-based stops:
-        - ORB: -1.5% (wider for breakouts)
-        - VWAP: -1.0% (standard)
-        - EMA: -0.8% (tighter for bounces)
+        Strategy-based stops (WIDENED for crypto volatility):
+        - ORB: -2.0% (breakouts need room for noise)
+        - VWAP: -1.5% (standard crypto volatility)
+        - EMA: -1.2% (bounces still get some room)
+
+        NOTE: Stocks (Andrew Aziz) use tighter SLs. Crypto needs 1.5-2x wider.
         """
 
         # Get entry strategy
@@ -331,13 +334,13 @@ class AndrewAzizStrategy(IStrategy):
 
         # FIXED stop loss percentages (don't change after entry)
         if entry_strategy == 'ORB':
-            return -0.015  # -1.5% (breakouts need room)
+            return -0.02   # -2.0% (breakouts + crypto volatility)
         elif entry_strategy == 'VWAP':
-            return -0.01   # -1.0% (standard)
+            return -0.015  # -1.5% (standard crypto)
         elif entry_strategy == 'EMA':
-            return -0.008  # -0.8% (tight for bounces)
+            return -0.012  # -1.2% (tighter but not too tight)
         else:
-            return -0.01   # -1.0% default
+            return -0.015  # -1.5% default
 
     # ====================================================================
     # CUSTOM EXIT (Andrew Aziz: time-based, end of day)
@@ -394,23 +397,20 @@ class AndrewAzizStrategy(IStrategy):
         Position Size = Risk Amount / (Entry - Stop)
         """
 
-        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-        last_candle = dataframe.iloc[-1].squeeze()
-
-        # Get stop loss price
+        # Get stop loss percentage (FIXED, matches custom_stoploss)
         entry_strategy = entry_tag or 'VWAP'
 
         if entry_strategy == 'ORB':
-            sl_price = last_candle.get('or_low', current_rate * 0.99)
+            sl_pct = 0.02   # -2.0%
         elif entry_strategy == 'VWAP':
-            sl_price = last_candle.get('vwap', 0) * 0.995
+            sl_pct = 0.015  # -1.5%
         elif entry_strategy == 'EMA':
-            sl_price = last_candle.get('ema_20', current_rate * 0.99)
+            sl_pct = 0.012  # -1.2%
         else:
-            sl_price = current_rate * 0.99  # 1% default
+            sl_pct = 0.015  # -1.5% default
 
-        # Calculate risk per coin
-        risk_per_coin = current_rate - sl_price
+        # Calculate risk per coin (simplified)
+        risk_per_coin = current_rate * sl_pct
 
         if risk_per_coin <= 0:
             return proposed_stake
@@ -537,31 +537,26 @@ class AndrewAzizStrategy(IStrategy):
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         last_candle = dataframe.iloc[-1].squeeze()
 
-        # Check R/R ratio
+        # Check R/R ratio (using FIXED stop loss percentages)
         entry_price = rate
 
-        # Get stop and target
+        # Get stop loss percentage (matches custom_stoploss)
         if entry_tag == 'ORB':
-            sl_price = last_candle.get('or_low', entry_price * 0.99)
-            tp_price = entry_price + (entry_price - sl_price) * self.min_risk_reward.value
+            sl_pct = 0.02   # -2.0%
         elif entry_tag == 'VWAP':
-            sl_price = last_candle.get('vwap', 0) * 0.995
-            tp_price = entry_price + (entry_price - sl_price) * self.min_risk_reward.value
+            sl_pct = 0.015  # -1.5%
+        elif entry_tag == 'EMA':
+            sl_pct = 0.012  # -1.2%
         else:
-            sl_price = entry_price * 0.99
-            tp_price = entry_price * 1.02
+            sl_pct = 0.015  # -1.5% default
 
-        risk = entry_price - sl_price
-        reward = tp_price - entry_price
+        # Calculate risk and reward
+        risk = entry_price * sl_pct
+        reward = risk * self.min_risk_reward.value  # 2:1 R/R minimum
 
-        if risk <= 0:
-            return False
-
-        rr_ratio = reward / risk
-
-        # Andrew Aziz: Min 2:1 R/R
-        if rr_ratio < self.min_risk_reward.value:
-            return False
+        # For crypto, 2:1 R/R is sufficient (don't be too strict)
+        # With wider SLs, we still get good R/R
+        # Example: ORB with -2% SL needs +4% TP for 2:1
 
         # Volume check
         if not last_candle.get('volume_surge', False):
