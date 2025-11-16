@@ -89,10 +89,34 @@ def main():
     feature_engineer = AdvancedFeatureEngineer(config)
     df = feature_engineer.engineer_all_features(df)
 
-    # Remove rows with NaN (from rolling calculations)
+    # Handle NaN values smartly (from rolling calculations)
     initial_len = len(df)
+
+    # Strategy 1: Drop rows where >50% of columns are NaN
+    threshold = len(df.columns) * 0.5
+    df = df.dropna(thresh=threshold)
+
+    # Strategy 2: Forward fill remaining NaNs (for rolling features)
+    df = df.ffill()
+
+    # Strategy 3: Backward fill any remaining NaNs at the start
+    df = df.bfill()
+
+    # Strategy 4: Fill any remaining NaNs with median
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+
+    # Final safety check - drop rows with any remaining NaNs
     df = df.dropna()
-    print(f"\n✓ Features engineered. Rows after dropna: {len(df):,} (dropped {initial_len - len(df):,})\n")
+
+    print(f"\n✓ Features engineered. Rows after cleaning: {len(df):,} (dropped {initial_len - len(df):,})\n")
+
+    if len(df) == 0:
+        print("❌ ERROR: All data was dropped! This usually means:")
+        print("   1. Not enough data (need at least 200 bars)")
+        print("   2. Data quality issues (check for NaN/inf values)")
+        print("   3. Rolling window periods too large")
+        return
 
     # ========================================================================
     # 3. CREATE LABELS

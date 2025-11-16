@@ -8,7 +8,16 @@ import os
 # DATA CONFIGURATION
 # ============================================================
 
-DATA_PATH = "/content/AVAXUSDT_5m_ALL_YEARS.csv"  # Update with your path
+# ⚠️  IMPORTANT: Update this path to your CSV file!
+# Examples:
+#   Linux/Mac: "/home/user/data/AVAXUSDT_5m.csv"
+#   Windows: "C:/Users/YourName/data/AVAXUSDT_5m.csv"
+#   Google Colab: "/content/AVAXUSDT_5m_ALL_YEARS.csv"
+#
+# CSV must have columns: timestamp, open, high, low, close, volume
+
+DATA_PATH = "/content/AVAXUSDT_5m_ALL_YEARS.csv"  # ⚠️  UPDATE THIS!
+
 SYMBOL = "AVAXUSDT"
 TIMEFRAME = "5m"
 
