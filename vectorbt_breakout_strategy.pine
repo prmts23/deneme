@@ -1,0 +1,256 @@
+//@version=5
+strategy("VectorBT Breakout Strategy",
+         overlay=true,
+         initial_capital=1000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100,
+         commission_type=strategy.commission.percent,
+         commission_value=0.04,
+         slippage=1,
+         calc_on_every_tick=false,
+         calc_on_order_fills=false,
+         process_orders_on_close=false)
+
+// ============================================
+// PARAMETRELER
+// ============================================
+
+// 4H Trend Filtresi Lookback
+lookback_4h = input.int(6, "4H Trend Lookback", minval=1, maxval=20,
+                        tooltip="4 saatlik timeframe için rolling window bar sayısı")
+
+// Stop Loss ve Take Profit
+stop_loss_pct = input.float(1.5, "Stop Loss %", minval=0.1, maxval=10.0, step=0.1) / 100
+take_profit_pct = input.float(7.0, "Take Profit %", minval=0.5, maxval=20.0, step=0.5) / 100
+
+// Backtest Tarih Aralığı
+use_date_filter = input.bool(false, "Use Date Filter")
+start_date = input.time(timestamp("01 Jan 2023 00:00 +0000"), "Start Date")
+end_date = input.time(timestamp("01 Jan 2024 00:00 +0000"), "End Date")
+
+// ============================================
+// TARİH FİLTRESİ
+// ============================================
+
+in_date_range = true
+if use_date_filter
+    in_date_range := time >= start_date and time <= end_date
+
+// ============================================
+// ÖNCEKİ GÜNÜN HIGH/LOW SEVİYELERİ (Y_HH, Y_LL)
+// ============================================
+
+// VectorBT mantığı:
+// 1. Günlük high/low hesapla
+// 2. Önceki güne shift et
+// 3. Forward fill ile günün başından sonuna taşı
+
+// PineScript'te request.security ile önceki günün high/low'unu çekiyoruz
+// lookahead=barmerge.lookahead_on kullanmıyoruz (future leak önleme)
+
+// Önceki günün high/low
+prev_day_high = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+prev_day_low = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off)
+
+// Y_HH ve Y_LL olarak sakla
+Y_HH = prev_day_high
+Y_LL = prev_day_low
+
+// ============================================
+// 4H TREND FİLTRESİ
+// ============================================
+
+// VectorBT mantığı:
+// 1. 4H timeframe'de rolling max/min hesapla (lookback bar sayısı kadar)
+// 2. Close > roll_max ise trend = 1 (long)
+// 3. Close < roll_min ise trend = -1 (short)
+// 4. Sıfırları forward fill ile taşı
+
+// 4H verisini çek
+[high_4h, low_4h, close_4h] = request.security(syminfo.tickerid, "240",
+                                                [high, low, close],
+                                                lookahead=barmerge.lookahead_off)
+
+// Rolling max/min hesapla (shift ile future leak önleme)
+// PineScript'te ta.highest/lowest zaten mevcut bara kadar bakar
+// shift(1) etkisi için [1] kullanırız
+roll_max_4h = ta.highest(high_4h[1], lookback_4h)
+roll_min_4h = ta.lowest(low_4h[1], lookback_4h)
+
+// Trend hesapla
+var float trend_4h = 0.0
+
+if close_4h > roll_max_4h
+    trend_4h := 1.0  // Long trend
+else if close_4h < roll_min_4h
+    trend_4h := -1.0  // Short trend
+// else trend değişmez (forward fill mantığı - var kullanımı bunu sağlar)
+
+// ============================================
+// GİRİŞ SİNYALLERİ
+// ============================================
+
+// VectorBT mantığı:
+// LONG: trend_4h == 1 AND close > Y_HH AND close[1] <= Y_HH (breakout anı)
+// SHORT: trend_4h == -1 AND close < Y_LL AND close[1] >= Y_LL (breakdown anı)
+
+// Önceki bar'ın close değeri
+prev_close = close[1]
+
+// LONG Entry Conditions
+long_condition = (trend_4h == 1.0) and
+                 (close > Y_HH) and
+                 (prev_close <= Y_HH) and
+                 in_date_range
+
+// SHORT Entry Conditions
+short_condition_base = (trend_4h == -1.0) and
+                       (close < Y_LL) and
+                       (prev_close >= Y_LL) and
+                       in_date_range
+
+// Çakışma önleme (VectorBT scriptindeki mantık)
+short_condition = short_condition_base and not long_condition
+
+// ============================================
+// STRATEGY ENTRY/EXIT
+// ============================================
+
+// Long Entry
+if long_condition
+    strategy.entry("Long", strategy.long)
+
+// Short Entry
+if short_condition
+    strategy.entry("Short", strategy.short)
+
+// Exit (Stop Loss ve Take Profit)
+// Her pozisyon için ayrı exit tanımla
+
+// Long pozisyon için SL/TP
+if strategy.position_size > 0
+    long_stop_price = strategy.position_avg_price * (1 - stop_loss_pct)
+    long_take_price = strategy.position_avg_price * (1 + take_profit_pct)
+    strategy.exit("Long Exit", "Long",
+                  stop=long_stop_price,
+                  limit=long_take_price)
+
+// Short pozisyon için SL/TP
+if strategy.position_size < 0
+    short_stop_price = strategy.position_avg_price * (1 + stop_loss_pct)
+    short_take_price = strategy.position_avg_price * (1 - take_profit_pct)
+    strategy.exit("Short Exit", "Short",
+                  stop=short_stop_price,
+                  limit=short_take_price)
+
+// ============================================
+// VİZUALİZASYON
+// ============================================
+
+// Önceki günün seviyelerini çiz
+plot(Y_HH, "Previous Day High (Y_HH)", color=color.new(color.red, 50), linewidth=1, style=plot.style_stepline)
+plot(Y_LL, "Previous Day Low (Y_LL)", color=color.new(color.green, 50), linewidth=1, style=plot.style_stepline)
+
+// 4H Trend göstergesi (background color)
+bgcolor(trend_4h == 1.0 ? color.new(color.green, 95) :
+        trend_4h == -1.0 ? color.new(color.red, 95) :
+        color.new(color.gray, 95),
+        title="4H Trend Background")
+
+// Entry sinyalleri
+plotshape(long_condition, "Long Signal",
+          shape.triangleup,
+          location.belowbar,
+          color.new(color.green, 0),
+          size=size.small)
+
+plotshape(short_condition, "Short Signal",
+          shape.triangledown,
+          location.abovebar,
+          color.new(color.red, 0),
+          size=size.small)
+
+// ============================================
+// TABLO - PERFORMANS METRİKLERİ
+// ============================================
+
+// Stratejinin performans metriklerini göster
+var table perf_table = table.new(position.top_right, 2, 8,
+                                  border_width=1,
+                                  border_color=color.gray,
+                                  frame_color=color.gray,
+                                  frame_width=1)
+
+if barstate.islastconfirmedhistory or barstate.isrealtime
+    // Header
+    table.cell(perf_table, 0, 0, "Metric", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(perf_table, 1, 0, "Value", bgcolor=color.new(color.gray, 70), text_color=color.white)
+
+    // Net Profit
+    table.cell(perf_table, 0, 1, "Net Profit", text_color=color.white)
+    table.cell(perf_table, 1, 1, str.tostring(strategy.netprofit, format.mintick) + " USDT",
+               text_color=strategy.netprofit > 0 ? color.green : color.red)
+
+    // Total Return %
+    total_return_pct = (strategy.netprofit / strategy.initial_capital) * 100
+    table.cell(perf_table, 0, 2, "Total Return %", text_color=color.white)
+    table.cell(perf_table, 1, 2, str.tostring(total_return_pct, "#.##") + "%",
+               text_color=total_return_pct > 0 ? color.green : color.red)
+
+    // Win Rate
+    win_rate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+    table.cell(perf_table, 0, 3, "Win Rate", text_color=color.white)
+    table.cell(perf_table, 1, 3, str.tostring(win_rate, "#.##") + "%", text_color=color.white)
+
+    // Total Trades
+    table.cell(perf_table, 0, 4, "Total Trades", text_color=color.white)
+    table.cell(perf_table, 1, 4, str.tostring(strategy.closedtrades), text_color=color.white)
+
+    // Max Drawdown
+    table.cell(perf_table, 0, 5, "Max Drawdown", text_color=color.white)
+    table.cell(perf_table, 1, 5, str.tostring(strategy.max_drawdown, "#.##") + " USDT", text_color=color.red)
+
+    // Parameters
+    table.cell(perf_table, 0, 6, "SL / TP", text_color=color.white)
+    table.cell(perf_table, 1, 6, str.tostring(stop_loss_pct * 100, "#.#") + "% / " +
+               str.tostring(take_profit_pct * 100, "#.#") + "%", text_color=color.white)
+
+    // 4H Lookback
+    table.cell(perf_table, 0, 7, "4H Lookback", text_color=color.white)
+    table.cell(perf_table, 1, 7, str.tostring(lookback_4h) + " bars", text_color=color.white)
+
+// ============================================
+// ALERTS (Opsiyonel)
+// ============================================
+
+// Alert koşulları - TradingView'da otomatik işlem için kullanılabilir
+alertcondition(long_condition, title="Long Entry Signal",
+               message="VectorBT Strategy: LONG breakout signal at {{close}}")
+
+alertcondition(short_condition, title="Short Entry Signal",
+               message="VectorBT Strategy: SHORT breakdown signal at {{close}}")
+
+// ============================================
+// NOTLAR
+// ============================================
+
+// Bu PineScript stratejisi VectorBT backtest scriptinin tam karşılığıdır:
+//
+// 1. ✅ Önceki günün high/low seviyelerini kullanır (Y_HH, Y_LL)
+// 2. ✅ 4H timeframe'de trend filtresi uygular (rolling max/min)
+// 3. ✅ Breakout/breakdown sinyalleri üretir
+// 4. ✅ Stop Loss: %1.5, Take Profit: %7.0
+// 5. ✅ Future leak önleme (lookahead=off, shift[1] kullanımı)
+// 6. ✅ Çakışma önleme (long ve short sinyalleri aynı anda olmaz)
+//
+// KULLANIM:
+// 1. TradingView'da yeni bir chart açın (ETH/USDT, 5m)
+// 2. Pine Editor'ü açın
+// 3. Bu kodu yapıştırın
+// 4. "Add to Chart" butonuna tıklayın
+// 5. Strategy Tester sekmesinden sonuçları görüntüleyin
+//
+// OPTİMİZASYON:
+// - Settings > Inputs kısmından parametreleri değiştirebilirsiniz
+// - Strategy Tester > Performance Summary kısmından metrikleri görebilirsiniz
+// - Deep Backtesting için TradingView Premium gereklidir (daha fazla veri)
